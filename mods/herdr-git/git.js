@@ -190,6 +190,8 @@ export function partialPatch(text, pick, reverse) {
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     if (l.startsWith("diff --git ")) { flush(); header = [l]; continue; }
+    // A submodule's commit summary isn't patch text: skip it up to the next file.
+    if (l.startsWith("Submodule ")) { flush(); header = null; continue; }
     if (l.startsWith("@@")) { flush(); if (header || out.length) hunk = { head: l, body: [], some: false, kept: true }; continue; }
     if (!hunk) { header?.push(l); continue; }
     const k = l[0];
