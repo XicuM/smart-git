@@ -2,16 +2,18 @@
 // (props.view "diff") and its own dialogs (props.view "ask").
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, closeOverlay, terminals, checking, agents, knownAgents } from "herdr";
+import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, closeOverlay, terminals, checking, agents, knownAgents, layout } from "herdr";
 import {
   perf, location, git, findRoot, writeThere, rebaseWith, openEditor, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
   parseRemotes, parseRefs, parseReflog, LOG_FORMAT, BRANCH_FORMAT, REF_FORMAT, REFLOG_FORMAT,
 } from "./git.js";
 import { Diff } from "./diff.js";
-import { ask, confirm, keyOf, Ask } from "./ask.js";
+import { ask, askFrom, confirm, keyOf, Ask, asking, cancelAsks } from "./ask.js";
 
 const ROW = 26, HEAD = 30;
 const seen = new Map();
+// The repos entered (submodules) per space and folder, so coming back to a space shows the submodule you left.
+const entered = new Map();
 // The commit box's unsent subject and description, per repo.
 const drafts = new Map();
 // How each agent in Herdr's table (knownAgents keys) answers one prompt and exits: its arguments
@@ -112,8 +114,22 @@ export default class HerdrGit extends View {
       for (;;) {
         const c = await nextCommand();
         if (c === "focus") this.part.handle.focus();
-        // From the diff: the sidebar takes the keyboard, then presses the key it passed on (`sidebar:2`).
-        else if (c.startsWith("sidebar")) { if (this.part.panel) { this.part.handle.focus(); if (c[7] === ":") this.part.key(c.slice(8), cx); } }
+        // From the diff (esc, 1–5) or a key bound to `smart-git.sidebar`: the sidebar takes the keyboard,
+        // then presses the key it passed on (`sidebar:2`). Behind Files in its stack, or in a hidden
+        // column, focus would go nowhere you can see: it brings itself to the front first.
+        else if (c.startsWith("sidebar")) {
+          if (!this.part.panel) continue;
+          const find = (n, up) => n?.content?.mod === "smart-git" && !n.content.props?.view ? [...up, n] : (n?.children ?? []).reduce((hit, k) => hit ?? find(k, [...up, n]), null);
+          const path = find(layout(), []) ?? [];
+          for (let i = 1; i < path.length; i++) {
+            if (path[i - 1].type === "stack") await run("layout.select", { stack: path[i - 1].id, child: path[i].id });
+            else if (path[i].hidden) await run("layout.show", { id: path[i].id });
+          }
+          await cx.sleep(50);
+          this.part.handle.focus(); if (c[7] === ":") this.part.key(c.slice(8), cx);
+        }
+        // The diff pane's graph picked a commit or label to act on (`smart-git:pick`).
+        else if (c === "pick") { if (this.part.panel) this.part.pick(shared("smart-git:pick") ?? {}, cx); }
         // `smart-git.key:<k>` presses a key, for scripts and tests.
         else if (c.startsWith("key:")) this.part.key?.(c.slice(4), cx);
         cx.notify();
@@ -162,7 +178,7 @@ class Sidebar {
   viewOf(panel) { const v = this.tabs[panel] ?? panel; return v === "remotes" && this.inRemote ? "remote-branches" : v; }
   get view() { return this.viewOf(this.panel); }
 
-  // Follows the focused terminal's repo, with the repos it's a submodule of before it.
+  // Follows the focused terminal's repo; submodules entered from it stack on top.
   follow(cx) {
     const loc = location(), key = JSON.stringify(loc);
     // A tab with no terminal (only mods) says nothing about the repo: stay on this one.
@@ -170,13 +186,11 @@ class Sidebar {
     if (key === this.where || !loc.cwd) return;
     this.where = key; this.space = loc.space;
     cx.spawn(async (cx) => {
-      const stack = [];
-      for (let root = await findRoot(loc.cwd, loc.on); root;) {
-        stack.unshift({ root, on: loc.on });
-        const r = await exec("git", ["rev-parse", "--show-superproject-working-tree"], { cwd: root, on: loc.on });
-        root = r.code === 0 ? r.stdout.trim() : "";
-      }
+      // Just the repo the terminal is in: a submodule opened as its own space is its own instance.
+      const root = await findRoot(loc.cwd, loc.on), stack = root ? [{ root, on: loc.on }] : [];
       if (this.where !== key) return;
+      const was = entered.get(key);
+      if (was?.length > stack.length && stack.every((r, n) => r.root === was[n].root && r.on === was[n].on)) stack.push(...was.slice(stack.length));
       // The same repo, or one entered from it: stay where the person is.
       if (stack.length && stack.every((r, n) => r.root === this.stack[n]?.root && r.on === this.stack[n]?.on)) return;
       this.go(stack, cx);
@@ -186,6 +200,7 @@ class Sidebar {
   // Each repo keeps what it showed, so coming back to it (another space or tab) is instant
   // and the refresh only updates it.
   go(stack, cx) {
+    if (this.where) entered.set(this.where, stack);
     const key = (st) => JSON.stringify(st), keep = ["head", "files", "branches", "commits", "stash", "submodules", "worktrees", "remotes", "remoteBranches", "tags", "reflog", "ops", "todo", "gitDir", "sel", "inRemote", "stamp", "raw"];
     if (this.stack.length) seen.set(key(this.stack), Object.fromEntries(keep.map((k) => [k, this[k]])));
     if (this.stack.length) drafts.set(key(this.stack), [this.subject.value(), this.body.value()]);
@@ -226,8 +241,9 @@ class Sidebar {
   refresh(cx) {
     const repo = this.repo;
     if (!repo) return;
-    if (this.loading) { this.again = true; return; }
-    this.loading = true; this.again = false;
+    // A hot reload stops this task before its finally: a lock older than git's 30s timeout is from a task that's gone.
+    if (this.loading && Date.now() - this.loading < 40000) { this.again = true; return; }
+    this.loading = Date.now(); this.again = false;
     const soft = (p) => p.catch(() => "");
     // Submodules cost a git run in each of them (half a second in a repo of 65): only while their tab shows.
     const subsShown = this.tabs.files === "submodules";
@@ -267,7 +283,7 @@ class Sidebar {
         for (let i = 0; i < status.length; i++) h = (h * 31 + status.charCodeAt(i)) | 0;
         this.stamp = h; this.error = null;
       } catch (e) { if (repo === this.repo) this.error = String(e.message ?? e); }
-      finally { this.loading = false; if (this.again) this.refresh(cx); if (!same) { this.show(cx); cx.notify(); } }
+      finally { this.loading = 0; if (this.again) this.refresh(cx); if (!same) { this.show(cx); cx.notify(); } }
     });
   }
 
@@ -359,7 +375,10 @@ class Sidebar {
     if (row.dir) { const news = files.filter((f) => f.untracked).map((f) => f.path); if (news.length) s = { ...s, news: news.slice(0, 50) }; }
     // Sent once the selection rests 60 ms: every setShared redraws every mod and the diff runs git,
     // so a held arrow key sends only where it stops. `edits` reloads a file edited again.
-    this.next = { repo, ...s, stamp: s.kind === "file" || s.kind === "conflict" ? [this.stamp, this.edits ?? 0] : undefined };
+    // A graph reloads when a ref or HEAD moves (an action picked in it included).
+    const stamp = s.kind === "file" || s.kind === "conflict" ? [this.stamp, this.edits ?? 0]
+      : ["branch", "remote", "status"].includes(s.kind) && !s.repo ? JSON.stringify([this.head.oid, this.branches, this.remoteBranches, this.tags]) : undefined;
+    this.next = { repo, ...s, stamp };
     const gen = this.sendGen = (this.sendGen ?? 0) + 1;
     cx.timer.after(60, () => {
       if (gen !== this.sendGen) return;
@@ -400,13 +419,19 @@ class Sidebar {
   }
 
   // Runs one change, shows what failed, and reloads.
+  // An action that is only waiting on a dialog doesn't block: the new one cancels that dialog.
   act(label, work, cx) {
-    if (this.busy) return;
+    // A hot reload can stop the running action before it unlocks: pressing again runs anyway.
+    if (this.busy && !asking() && this.refused !== label) { this.refused = label; this.note = `Still ${this.busy} Press again to run anyway.`; cx.notify(); return; }
+    this.refused = null;
+    cancelAsks();
+    const n = this.acts = (this.acts ?? 0) + 1;
     this.busy = label; this.note = null; this.info = null; cx.notify();
     cx.spawn(async (cx) => {
+      askFrom(cx, this.handle);
       try { await work(cx); }
       catch (e) { this.note = String(e.message ?? e); }
-      finally { this.busy = null; this.refresh(cx); cx.notify(); }
+      finally { if (this.acts === n) this.busy = null; this.refresh(cx); cx.notify(); }
     });
   }
 
@@ -480,11 +505,11 @@ class Sidebar {
 
   // I: an agent CLI writes the commit box's subject and description from the staged changes
   // (everything, when nothing is staged).
-  // `once`: pick the agent and model for this message only (shift-click ✨).
-  async generate(once = false) {
+  async generate(cx) {
     if (!this.files.length) throw new Error("Nothing to commit");
-    const a = once ? await this.pickAgent(false) : await this.chosenAgent();
-    if (!a) { if (once) return; throw new Error("No installed agent can write commit messages yet: ctrl-i sets one up"); }
+    const a = await this.chosenAgent();
+    if (!a) { throw new Error("No installed agent can write commit messages yet: ctrl-i sets one up"); }
+    this.busy = `Writing message with ${a.name}…`; cx.notify();
     const staged = this.files.some((f) => f.staged);
     let [diff, log] = await Promise.all([
       git(this.repo, ["diff", "--no-color", "--no-ext-diff", staged ? "--cached" : "HEAD"]).catch(() => ""),
@@ -697,7 +722,7 @@ class Sidebar {
   // Every key, list first (lazygit's defaults). A labelled one is also in the right-click
   // menu, the ? menu and the hints.
   actions(cx) {
-    const view = this.view, row = this.current(), rows = this.rows(view), i = this.sel[view] ?? 0;
+    const view = this.picked?.view ?? this.view, row = this.picked?.row ?? this.current(), rows = this.rows(view), i = this.sel[view] ?? 0;
     const index = PANELS.findIndex((p) => p.id === this.panel);
     const move = (n) => this.select(this.panel, i + n, cx);
     const act = (label, work) => this.act(label, work, cx);
@@ -726,20 +751,9 @@ class Sidebar {
         a: [stagesAll ? "Stage all" : "Unstage all", () => act(stagesAll ? "Staging all…" : "Unstaging all…", () => stagesAll ? this.w(["add", "-A"]) : this.w(["reset", "-q"]))],
         "|1": null,
         c: ["Write commit message", () => this.subject.focus()],
-        I: ["Write it with AI", () => act("Writing message…", () => this.generate())],
+        I: ["Write it with AI", () => act("Writing message…", (cx) => this.generate(cx))],
         w: ["Commit without hooks", () => act("Committing…", () => this.commit({ noVerify: true }))],
         C: ["Commit in your editor", () => this.inTerminal(["git", "commit"])],
-        A: ["Amend last commit…", () => act("Amending…", async () => {
-          const r = await ask({ title: "Amend last commit", detail: this.commits[0]?.subject, items: [
-            { key: "enter", label: "Amend with staged changes", value: "noedit" },
-            { key: "r", label: "Amend and reword…", value: "reword" },
-          ] });
-          if (r === "noedit") await this.w(["commit", "--amend", "--no-edit"]);
-          if (r === "reword") {
-            const m = await ask({ title: "Reword last commit", input: { value: this.commits[0]?.subject ?? "" }, description: true });
-            if (m?.text.trim()) await this.w(["commit", "--amend", "-m", m.text.trim(), ...(m.description.trim() ? ["-m", m.description.trim()] : [])]);
-          }
-        })],
         "|2": null,
         d: [row?.file?.sub ? "Reset submodule" : "Discard…", () => row && act("Discarding…", async () => {
           if (row.file?.sub) return this.resetSub(row.file.path);
@@ -784,7 +798,6 @@ class Sidebar {
         })],
         S: ["Stash some…", () => act("Stashing…", async () => {
           const r = await ask({ title: "Stash", items: [
-            { key: "a", label: "Stash all changes", value: ["--include-untracked"] },
             { key: "i", label: "Stash all changes and keep index", value: ["--include-untracked", "--keep-index"] },
             { key: "s", label: "Stash staged changes", value: ["--staged"] },
             { key: "u", label: "Stash unstaged changes", value: ["--keep-index"] },
@@ -881,6 +894,7 @@ class Sidebar {
         "|15": null,
         y: ["Copy path", () => row && cx.write_to_clipboard(row.id)],
         o: ["Open a terminal in it", () => row && this.inTerminal(undefined, `${this.repo.root}/${row.id}`)],
+        s: ["Open as a new space", () => row && run("space.new", { folder: `${this.repo.root}/${row.id}`, machine: this.repo.on ?? "" })],
       },
       branches: {
         space: ["Check out", () => row && !row.branch.current && act(`Checking out ${row.id}…`, () => this.w(["checkout", row.id]))],
@@ -1146,7 +1160,8 @@ class Sidebar {
     const global = {
       j: () => move(1), down: () => move(1), k: () => move(-1), up: () => move(-1),
       "ctrl-d": () => move(10), pagedown: () => move(10), "ctrl-u": () => move(-10), pageup: () => move(-10),
-      g: () => move(-rows.length), home: () => move(-rows.length), G: () => move(rows.length), end: () => move(rows.length),
+      // Not g/G: g is reset (commits, reflog) and pop (stash), as in lazygit.
+      home: () => move(-rows.length), end: () => move(rows.length),
       h: () => this.select(PANELS[(index + PANELS.length - 1) % PANELS.length].id, this.sel[this.viewOf(PANELS[(index + PANELS.length - 1) % PANELS.length].id)] ?? 0, cx),
       l: () => this.select(PANELS[(index + 1) % PANELS.length].id, this.sel[this.viewOf(PANELS[(index + 1) % PANELS.length].id)] ?? 0, cx),
       left: () => global.h(), right: () => global.l(), tab: () => global.l(), "shift-tab": () => global.h(),
@@ -1230,7 +1245,7 @@ class Sidebar {
   // The labelled keys as a menu: the list's (right-click), or with the global ones (?).
   menu(cx, all = false) {
     const { panel, global } = this.actions(cx);
-    const row = this.current(), explain = EXPLAIN[row?.todo ? "todo" : this.view] ?? {};
+    const picked = this.picked, row = picked?.row ?? this.current(), explain = EXPLAIN[row?.todo ? "todo" : picked?.view ?? this.view] ?? {};
     // A null entry ("|1", "|2"…) is a line between groups; one is dropped where a group came out empty.
     const items = [];
     for (const [key, a] of Object.entries(all ? { ...panel, "|panel": null, ...global } : panel)) {
@@ -1240,9 +1255,23 @@ class Sidebar {
     if (items.at(-1)?.sep) items.pop();
     if (!items.length) return;
     cx.spawn(async (cx) => {
+      askFrom(cx, this.handle);
       const k = await ask({ menu: !all, title: all ? "Keys" : row?.name ?? row?.text ?? null, items });
-      if (k) { this.key(k, cx); cx.notify(); }
+      if (k) { this.picked = picked; try { this.key(k, cx); } finally { this.picked = null; } cx.notify(); }
     });
+  }
+
+  // A commit or label the diff pane's graph picked, acted on with this list's keys as if selected
+  // here ("menu": the list's right-click menu). Only the list's own keys: the global ones move this panel.
+  pick({ root, view, id, key, commit }, cx) {
+    if (!this.repo || root !== this.repo.root) { this.note = "That graph is another repository's (a submodule): open it here to act on it"; return; }
+    const found = { commits: this.commits, branches: this.branches, "remote-branches": this.remoteBranches, tags: this.tags }[view]
+      ?.find((x) => (x.hash ?? x.name) === id);
+    const field = { commits: "commit", branches: "branch", "remote-branches": "rbranch", tags: "tag" }[view];
+    if (!field || !(found ?? commit)) return;
+    this.picked = { view, row: { id, [field]: found ?? commit, text: id } };
+    try { if (key === "menu") this.menu(cx); else if (this.actions(cx).panel[key]) this.key(key, cx); }
+    finally { this.picked = null; }
   }
 
   key(k, cx) {
@@ -1270,8 +1299,9 @@ class Sidebar {
       const label = name(row.dir ? row.name + "/" : row.name, f ? (f.conflict ? t.ansi1 : staged ? t.ansi2 : f.untracked ? t.ansi1 : t.foreground) : staged ? t.ansi2 : some ? t.blocked : t.muted);
       const xy = f ? h_flex().flex_none().w(18).text_size(11).child(div().text_color(t.ansi2).child(f.x === "." ? " " : f.x === "?" ? "?" : f.x)).child(div().text_color(t.ansi1).child(f.y === "." ? " " : f.y))
         : h_flex().flex_none().w(18).text_color(staged ? t.ansi2 : some ? t.blocked : t.dim).child(icon(this.collapsed.has(row.dir) ? "chevron-right" : "chevron-down").size(12));
-      // A submodule says what changed in it: its commit, its files, or new files.
-      const sub = f?.sub ? [f.sub[1] === "C" && "commit", f.sub[2] === "M" && "modified", f.sub[3] === "U" && "untracked"].filter(Boolean).join(", ") : "";
+      // A submodule only says when its commit moved: that's what space stages here. Changed files inside
+      // can't be staged from the parent (enter it); the diff says which.
+      const sub = f?.sub?.[1] === "C" ? "new commit" : "";
       const done = row.dir ? files.filter((x) => x.staged && !x.unstaged).length : 0;
       return base.pl(8 + row.depth * 12).child(xy).child(label)
         .when(Boolean(row.dir) && done > 0 && !staged, (e) => e.child(dim(`${done}/${files.length} staged`)))
@@ -1329,24 +1359,35 @@ class Sidebar {
       this.folded.has(id) ? this.folded.delete(id) : this.folded.add(id);
       setShared("smart-git:folded", [...this.folded]); cx.notify();
     };
-    // The title bar: where you are (submodules as a breadcrumb), the branch, and what's running.
+    // What's running shows in the bottom strip, and as a spinner on what started it (✨, ✓, the branch chip).
+    const spin = () => div().flex_none().text_color(t.working).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90);
+    const running = Boolean(this.busy) && !asking(), syncing = running && ["Pulling…", "Pushing…", "Fetching…"].includes(this.busy);
+    // The title bar: where you are (submodules as a breadcrumb) and the branch.
     const title = h_flex().h(42).flex_none().px(14).gap(4).items_center().border_b(1).border_color(t.border)
       .when(!this.repo, (e) => e.child(div().font_semibold().child("Git")))
-      .children(this.stack.map((r, n) => div().id(`crumb-${n}`).flex_none().px(2).rounded(4).font_semibold().cursor_pointer()
-        .text_color(n === this.stack.length - 1 ? t.foreground : t.muted).hover((s) => s.text_color(t.foreground))
-        .on_click((_e, cx) => { if (n < this.stack.length - 1) this.go(this.stack.slice(0, n + 1), cx); })
-        .child((n ? "› " : "") + (n ? r.root.slice(this.stack[n - 1].root.length + 1) : r.root.split("/").pop()))))
-      .when(Boolean(this.repo), (e) => e.child(h_flex().id("branch").ml(4).min_w(0).h(22).px(6).gap(5).items_center().rounded(6).cursor_pointer()
+      // The last crumb (a long submodule path) shrinks, so the branch stays in view.
+      // Long submodule paths are cut at the start with "…", so the tail stays.
+      .children(this.stack.flatMap((r, n) => {
+        const last = n === this.stack.length - 1, x = n ? r.root.slice(this.stack[n - 1].root.length + 1) : r.root.split("/").pop();
+        return [
+          ...(n ? [div().flex_none().text_color(t.muted).child("›")] : []),
+          div().id(`crumb-${n}`).when(!last, (e) => e.flex_none()).when(last, (e) => e.min_w(0).overflow_hidden().whitespace_nowrap().text_ellipsis_start()).px(2).rounded(4).font_semibold().cursor_pointer()
+            .text_color(last ? t.foreground : t.muted).hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => { if (!last) this.go(this.stack.slice(0, n + 1), cx); })
+            .child(x),
+        ];
+      }))
+      .child(div().flex_1())
+      .when(Boolean(this.repo), (e) => e.child(h_flex().id("branch").flex_none().max_w(200).h(22).px(6).gap(5).items_center().rounded(6).cursor_pointer()
         .text_size(11.5).text_color(this.panel === "status" ? t.foreground : t.muted)
         .when(this.panel === "status", (e) => e.bg(focused ? t.selected : t.hover)).hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => { this.handle.focus(); this.select("status", 0, cx); })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.handle.focus(); this.select("status", 0, cx); this.menu(cx, true); })
         .child(icon("git-branch").size(12).flex_none())
-        .child(div().min_w(0).truncate().child(h.branch === "(detached)" ? h.oid?.slice(0, 7) ?? "(detached)" : h.branch || (this.loading ? "…" : "(no branch)")))
-        .when(h.ahead > 0, (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${h.ahead}`)))
-        .when(h.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${h.behind}`)))))
-      .child(div().flex_1())
-      .when(Boolean(this.busy), (e) => e.child(div().flex_none().text_color(t.working).text_size(11).child(this.busy)).child(div().text_color(t.working).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)));
+        .child(div().min_w(0).truncate().text_size(12.5).child(h.branch === "(detached)" ? h.oid?.slice(0, 7) ?? "(detached)" : h.branch || (this.loading ? "…" : "(no branch)")))
+        .when(syncing, (e) => e.child(spin()))
+        .when(!syncing && h.ahead > 0, (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${h.ahead}`)))
+        .when(!syncing && h.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${h.behind}`)))));
     // What the repo is in the middle of, and the modes that change what lists show.
     const conflicts = this.files.filter((f) => f.conflict).length;
     const banners = [
@@ -1405,7 +1446,7 @@ class Sidebar {
     };
     // The commit box, as VS Code's: one card, the subject with ✨ (an agent writes it, right-click picks
     // the agent) and ✓ (commit), and the description under it once there's a subject (or one already).
-    const writingAi = this.busy === "Writing message…", hasSubject = Boolean(this.subject.value().trim());
+    const writingAi = Boolean(this.busy?.startsWith("Writing message")), hasSubject = Boolean(this.subject.value().trim());
     const tool = (id, tip, on, enabled = true) => div().id(id).size(24).flex_none().flex().items_center().justify_center().rounded(5)
       .text_color(enabled ? t.muted : t.dim).tooltip(tip)
       .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((e, cx) => { on(cx, e); cx.notify(); }));
@@ -1415,12 +1456,12 @@ class Sidebar {
       .border_color(this.typing ? t.accent : t.border).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .child(h_flex().h(32).pl(10).pr(3).gap(1).items_center()
         .child(div().flex_1().min_w(0).h_full().child(Input.new(this.subject).h_full().text_size(12.5)))
-        .child(tool("ai", writingAi ? "Writing the message…" : `Write the message with ${named} (I) · shift-click: another agent, once · right-click: choose`,
-          (cx, e) => this.act("Writing message…", () => this.generate(Boolean(e?.modifiers?.shift)), cx), !this.busy)
+        .child(tool("ai", writingAi ? "Writing the message…" : `Write the message with ${named} (I) · right-click: choose`,
+          (cx) => this.act("Writing message…", (cx) => this.generate(cx), cx), !this.busy)
           .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.act("…", () => this.pickAgent(), cx); })
-          .child(writingAi ? div().text_color(t.working).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90) : svg("mods/smart-git/sparkles.svg").size(13)))
+          .child(writingAi ? spin() : svg("mods/smart-git/sparkles.svg").size(13)))
         .child(tool("commit", "Commit (enter, ctrl-enter from the description)", (cx) => this.act("Committing…", () => this.commit(), cx), hasSubject && !this.busy)
-          .child(svg("mods/workspace-chrome/check.svg").size(14))))
+          .child(this.busy === "Committing…" ? spin() : svg("mods/workspace-chrome/check.svg").size(14))))
       .when(hasSubject || this.typing === "body" || Boolean(this.body.value()), (e) => e.child(div().border_t(1).border_color(t.border).pl(10).pr(8).py(6)
         .child(Textarea.new(this.body).w_full().text_size(12.5))));
     return v_flex().id("smart-git").size_full().min_h(0).overflow_hidden().rounded(10).border_1().border_color(t.border)
@@ -1447,9 +1488,14 @@ class Sidebar {
       .children(banners.map(banner))
       .when(Boolean(this.error) || !this.repo, (e) => e.child(div().flex_1().px(14).py(12).text_size(12).text_color(t.dim).child(this.error ?? "")))
       .when(!this.error && Boolean(this.repo), (e) => e.child(v_flex().flex_1().min_h(0).children(PANELS.slice(1).map((p, n) => section(p, n + 2)))))
-      .when(Boolean(this.note), (e) => e.child(div().id("note").flex_none().px(14).py(8).border_t(1).border_color(t.border).text_size(11.5).text_color(t.ansi1).cursor_pointer()
-        .on_click((_e, cx) => { this.note = null; cx.notify(); }).child(this.note)))
-      .when(Boolean(this.repo) && !this.error, (e) => e.child(div().flex_none().px(14).py(6).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim).truncate().child(this.hints())));
+      // One strip for the whole life of an action: the keys when idle, the spinner while it runs, then
+      // what went wrong (click to dismiss). The note wins: "Still … press again" comes while running.
+      .when(Boolean(this.note), (e) => e.child(h_flex().id("note").flex_none().px(14).py(6).gap(6).items_start().border_t(1).border_color(t.border).text_size(11.5).text_color(t.ansi1).cursor_pointer()
+        .on_click((_e, cx) => { this.note = null; cx.notify(); })
+        .child(div().flex_1().min_w(0).child(this.note)).child(div().flex_none().text_size(10.5).text_color(t.dim).child("dismiss"))))
+      .when(!this.note && running, (e) => e.child(h_flex().flex_none().px(14).py(6).gap(6).items_center().border_t(1).border_color(t.border).text_size(11.5).text_color(t.working)
+        .child(spin()).child(div().min_w(0).truncate().child(this.busy === "…" ? "Working…" : this.busy))))
+      .when(!this.note && !running && Boolean(this.repo) && !this.error, (e) => e.child(div().flex_none().px(14).py(6).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim).truncate().child(this.hints())));
   }
 
   summary(view) {
@@ -1468,7 +1514,7 @@ class Sidebar {
     const keys = {
       files: "space stage · a stage all · c message · I AI message · d discard",
       worktrees: "space switch · n new · o terminal · d remove",
-      submodules: "enter open · u update · n add · d remove",
+      submodules: "enter open · s new space · u update · n add · d remove",
       branches: "space check out · n new · M merge · r rebase · d delete",
       remotes: "enter branches · f fetch · n add · d remove",
       "remote-branches": "space check out · n new · M merge · d delete",
