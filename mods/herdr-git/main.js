@@ -22,6 +22,42 @@ const PANELS = [
 ];
 // What a repository in the middle of something is doing, by the file git keeps for it.
 const OPS = { "rebase-merge": "Rebasing", "rebase-apply": "Rebasing", MERGE_HEAD: "Merging", CHERRY_PICK_HEAD: "Cherry-picking", REVERT_HEAD: "Reverting", BISECT_LOG: "Bisecting" };
+// What the commit actions do to history, shown beside them in the menus (hover, or the selected row).
+const REWRITE = "Rewrites this commit and every one after it (new hashes): a pushed branch then needs a force push. z undoes it.";
+const EXPLAIN = {
+  commits: {
+    space: "Moves HEAD to this commit without a branch (detached). Commits you make there are lost unless you create a branch.",
+    g: "Moves the branch back to this commit. Commits after it leave the branch (the reflog keeps them); soft, mixed or hard says what happens to their changes.",
+    r: `Changes this commit's message only. ${REWRITE}`,
+    R: `Changes this commit's message in your editor. ${REWRITE}`,
+    s: `Melds this commit into the older one below it, keeping both messages. ${REWRITE}`,
+    f: `Melds this commit into the older one below it and discards this commit's message. ${REWRITE}`,
+    d: `Removes this commit and its changes from the branch; the commits after it are replayed without it and may conflict. ${REWRITE}`,
+    e: "Starts a rebase that stops at this commit, so you can amend it or split it; m continues.",
+    i: "Starts a rebase that stops just before this commit: reorder, squash or drop what follows, then m continues.",
+    "ctrl-j": `Swaps this commit with the older one below it; they may conflict. ${REWRITE}`,
+    "ctrl-k": `Swaps this commit with the newer one above it; they may conflict. ${REWRITE}`,
+    A: `Adds the staged changes into this commit. ${REWRITE}`,
+    F: "Makes a new \"fixup!\" commit of the staged changes, to meld into this one later (S). Nothing is rewritten yet.",
+    S: `Melds every "fixup!" commit made for this one into it. ${REWRITE}`,
+    t: "Adds a new commit that undoes this one. Nothing is rewritten: safe on pushed branches.",
+    V: "Applies the copied commits on top of the current branch as new commits; they may conflict.",
+  },
+  todo: {
+    p: "Keeps this commit as it is.",
+    s: "Melds this commit into the one before it, keeping both messages.",
+    f: "Melds this commit into the one before it and discards its message.",
+    e: "Stops the rebase at this commit, so you can amend it.",
+    d: "Takes this commit out of the rebase: its changes leave the branch.",
+    "ctrl-j": "Applies this commit earlier; they may conflict.",
+    "ctrl-k": "Applies this commit later; they may conflict.",
+  },
+  reflog: {
+    space: "Moves HEAD to this point without a branch (detached). Commits you make there are lost unless you create a branch.",
+    g: "Moves the branch to this point of its history; soft, mixed or hard says what happens to the changes in between. The reflog keeps where it was.",
+    V: "Applies the copied commits on top of the current branch as new commits; they may conflict.",
+  },
+};
 // The git dir, those files, and the todo of a rebase in progress.
 const STATE = 'd=$(git rev-parse --absolute-git-dir) || exit 0; echo "$d"; cd "$d"; for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$f" ] && echo "$f"; done; [ -f rebase-merge/git-rebase-todo ] && { echo "--todo"; cat rebase-merge/git-rebase-todo; }; true';
 
@@ -402,9 +438,9 @@ class Sidebar {
 
   async resetTo(hash, short, subject) {
     const r = await ask({ title: `Reset ${this.head.branch || "HEAD"} to ${short}`, detail: subject, items: [
-      { key: "s", label: "Soft: keep changes staged", value: "--soft" },
-      { key: "m", label: "Mixed: keep changes unstaged", value: "--mixed" },
-      { key: "h", label: "Hard: discard all changes", value: "--hard", danger: true },
+      { key: "s", label: "Soft: keep changes staged", value: "--soft", hint: "The changes of the commits left behind stay, staged, ready to commit again. Your working files don't change." },
+      { key: "m", label: "Mixed: keep changes unstaged", value: "--mixed", hint: "The changes of the commits left behind stay in your files, unstaged. Nothing is lost." },
+      { key: "h", label: "Hard: discard all changes", value: "--hard", danger: true, hint: "Your files become exactly this commit: the commits' changes and any uncommitted work are thrown away. Uncommitted work can't be recovered." },
     ] });
     if (r) await this.w(["reset", r, "-q", hash]);
   }
@@ -738,12 +774,12 @@ class Sidebar {
       } : {
         enter: ["View commit (select lines to move)", () => this.focusDiff()],
         space: ["Check out", () => row && act(`Checking out ${short}…`, async () => {
-          if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false)) await this.w(["checkout", "--detach", row.id]);
+          if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false, EXPLAIN.commits.space)) await this.w(["checkout", "--detach", row.id]);
         })],
         g: ["Reset to this commit…", () => row && act("Resetting…", () => this.resetTo(row.id, short, row.commit.subject))],
         r: ["Reword", () => row && act("Rewording…", async () => {
           const body = (await git(this.repo, ["log", "-1", "--format=%b", row.id])).trim();
-          const m = await ask({ title: `Reword ${short}`, input: { value: row.commit.subject }, description: true, descriptionValue: body });
+          const m = await ask({ title: `Reword ${short}`, detail: EXPLAIN.commits.r, input: { value: row.commit.subject }, description: true, descriptionValue: body });
           if (!m?.text.trim()) return;
           const msg = [m.text.trim(), ...(m.description.trim() ? ["-m", m.description.trim()] : [])];
           if (row.id === this.head.oid) return this.w(["commit", "--amend", "--only", "--no-verify", "-m", ...msg]);
@@ -754,10 +790,14 @@ class Sidebar {
         R: ["Reword in your editor", () => row && this.inTerminal(row.id === this.head.oid
           ? ["git", "commit", "--amend", "--only"]
           : ["git", "rebase", "-i", "--autostash", `${row.id}^`])],
-        s: ["Squash into the one below", () => row?.commit && act("Squashing…", () => this.rewrite(`${row.id}^`, (t) => { Sidebar.at(t, row.id).action = "squash"; }))],
-        f: ["Fixup into the one below", () => row?.commit && act("Fixing up…", () => this.rewrite(`${row.id}^`, (t) => { Sidebar.at(t, row.id).action = "fixup"; }))],
+        s: ["Squash into the one below", () => row?.commit && act("Squashing…", async () => {
+          if (await confirm(`Squash ${short} into the commit below?`, row.commit.subject, "Squash", true, EXPLAIN.commits.s)) await this.rewrite(`${row.id}^`, (t) => { Sidebar.at(t, row.id).action = "squash"; });
+        })],
+        f: ["Fixup into the one below", () => row?.commit && act("Fixing up…", async () => {
+          if (await confirm(`Fixup ${short} into the commit below?`, row.commit.subject, "Fixup", true, EXPLAIN.commits.f)) await this.rewrite(`${row.id}^`, (t) => { Sidebar.at(t, row.id).action = "fixup"; });
+        })],
         d: ["Drop", () => row?.commit && act("Dropping…", async () => {
-          if (await confirm(`Drop ${short}?`, row?.commit.subject, "Drop commit")) await this.rewrite(row.id, (t) => { t[0].action = "drop"; });
+          if (await confirm(`Drop ${short}?`, row?.commit.subject, "Drop commit", true, EXPLAIN.commits.d)) await this.rewrite(row.id, (t) => { t[0].action = "drop"; });
         })],
         e: ["Edit (stop at it)", () => row?.commit && act("Starting rebase…", () => this.rewrite(row.id, (t) => { t[0].action = "edit"; }))],
         i: ["Interactive rebase from here", () => row?.commit && act("Starting rebase…", () => this.rewrite(row.id, (t) => t.unshift({ action: "break", rest: "" })))],
@@ -772,14 +812,14 @@ class Sidebar {
         A: ["Amend with staged changes", () => row?.commit && act("Amending…", async () => {
           if (!this.files.some((f) => f.staged)) throw new Error("Stage the changes to amend with first");
           if (row?.id === this.head.oid) return this.w(["commit", "--amend", "--no-edit", "--no-verify"]);
-          if (!await confirm(`Amend ${short} with the staged changes?`, row?.commit.subject, "Amend", false)) return;
+          if (!await confirm(`Amend ${short} with the staged changes?`, row?.commit.subject, "Amend", false, EXPLAIN.commits.A)) return;
           await this.w(["commit", "--no-verify", `--fixup=${row.id}`]);
           await this.rewrite(row.id, null, { autosquash: true });
         })],
         F: ["Create fixup commit", () => row && act("Committing…", () => this.w(["commit", "--no-verify", `--fixup=${row.id}`]))],
         S: ["Squash fixups onto this", () => row?.commit && act("Squashing…", () => this.rewrite(row.id, null, { autosquash: true }))],
         t: ["Revert", () => row && act("Reverting…", async () => {
-          if (await confirm(`Revert ${short}?`, row.commit.subject, "Revert", false)) await this.w(["revert", "--no-edit", row.id], { timeout: 120000 });
+          if (await confirm(`Revert ${short}?`, row.commit.subject, "Revert", false, EXPLAIN.commits.t)) await this.w(["revert", "--no-edit", row.id], { timeout: 120000 });
         })],
         C: ["Copy for cherry-pick", () => row && this.toggleCopy(row.id, short)],
         V: ["Paste (cherry-pick) copied commits", () => this.paste(cx)],
@@ -817,7 +857,7 @@ class Sidebar {
       reflog: {
         enter: ["View commit", () => this.focusDiff()],
         space: ["Check out", () => row && act(`Checking out ${short}…`, async () => {
-          if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false)) await this.w(["checkout", "--detach", row.reflog.hash]);
+          if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false, EXPLAIN.reflog.space)) await this.w(["checkout", "--detach", row.reflog.hash]);
         })],
         g: ["Reset to this…", () => row && act("Resetting…", () => this.resetTo(row.reflog.hash, short, row.reflog.subject))],
         C: ["Copy for cherry-pick", () => row && this.toggleCopy(row.reflog.hash, short)],
@@ -830,7 +870,7 @@ class Sidebar {
         space: ["Apply", () => row && act("Applying stash…", () => this.w(["stash", "apply", row.id]))],
         g: ["Pop", () => row && act("Popping stash…", () => this.w(["stash", "pop", row.id]))],
         d: ["Drop", () => row && act("Dropping stash…", async () => {
-          if (await confirm(`Drop ${row.id}?`, row.stash.subject, "Drop")) await this.w(["stash", "drop", row.id]);
+          if (await confirm(`Drop ${row.id}?`, row.stash.subject, "Drop", true, "Deletes this stash and the changes saved in it.")) await this.w(["stash", "drop", row.id]);
         })],
         n: ["New branch from this stash", () => row && act("Creating branch…", async () => {
           const r = await ask({ title: `Branch from ${row.id}`, input: { placeholder: "Branch name" } });
@@ -929,10 +969,10 @@ class Sidebar {
   // The labelled keys as a menu: the list's (right-click), or with the global ones (?).
   menu(cx, all = false) {
     const { panel, global } = this.actions(cx);
-    const items = Object.entries(all ? { ...panel, ...global } : panel).filter(([, a]) => Array.isArray(a)).map(([key, [label]]) => ({ key, label, value: key }));
+    const row = this.current(), explain = EXPLAIN[row?.todo ? "todo" : this.view] ?? {};
+    const items = Object.entries(all ? { ...panel, ...global } : panel).filter(([, a]) => Array.isArray(a)).map(([key, [label]]) => ({ key, label, value: key, hint: panel[key] ? explain[key] : undefined }));
     if (!items.length) return;
     cx.spawn(async (cx) => {
-      const row = this.current();
       const k = await ask({ menu: !all, title: all ? "Keys" : row?.name ?? row?.text ?? null, items });
       if (k) { this.key(k, cx); cx.notify(); }
     });

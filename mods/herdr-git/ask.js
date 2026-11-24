@@ -28,7 +28,8 @@ export function ask(spec) {
   });
 }
 const reply = (id, value) => { replies.get(id)?.(value); replies.delete(id); };
-export const confirm = (title, detail, label, danger = true) => ask({ title, detail, items: [{ key: "enter", label, value: true, danger }] });
+// `hint` explains what the action does (shown under it), for the ones that change history.
+export const confirm = (title, detail, label, danger = true, hint) => ask({ title, detail, items: [{ key: "enter", label, value: true, danger, hint }] });
 
 
 // A dialog: a menu (items with keys) or a text input, answering the promise ask() made.
@@ -68,15 +69,20 @@ export class Ask {
 
   render(cx) {
     const t = theme(), p = props() ?? {}, items = p.items ?? [];
+    // What the selected item does, when it says (destructive git commands do).
+    const hint = items[this.sel]?.hint;
+    const explain = () => div().when(Boolean(hint), (e) => e.mt(6).px(8).py(6).border_t(1).border_color(t.border).text_size(11.5).text_color(items[this.sel]?.danger ? t.ansi1 : t.muted).child(hint ?? ""));
     // A right-click menu: compact rows like Herdr's own menu, each with its key on the right.
     if (p.menu) return v_flex().id("herdr-git-menu").w_full().max_h(640).p(5).bg(t.popover).text_color(t.foreground).text_size(12.8)
       .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .when(Boolean(p.title), (e) => e.child(div().h(26).flex_none().px(8).flex().items_center().text_size(11.5).text_color(t.dim).truncate().child(p.title)))
-      .child(v_flex().id("items").flex_shrink().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(30).flex_none().px(8).gap(9).items_center().rounded(7).cursor_pointer()
+      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(30).flex_none().px(8).gap(9).items_center().rounded(7).cursor_pointer()
         .when(n === this.sel, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
         .on_click(() => this.done(item.value))
+        .when(Boolean(item.hint), (e) => e.tooltip(item.hint))
         .child(div().flex_1().min_w(0).truncate().text_color(item.danger ? t.ansi1 : t.foreground).child(item.label))
-        .child(div().flex_none().text_size(11).text_color(t.dim).child(item.key)))));
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(item.key)))))
+      .child(explain());
     return v_flex().id("herdr-git-ask").w_full().max_h(620).p(p.menu ? 6 : 16).gap(p.menu ? 0 : 10).bg(t.popover).text_color(t.foreground).text_size(13)
       .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .when(Boolean(p.title), (e) => e.child(div().font_semibold().when(Boolean(p.menu), (e) => e.px(8).h(26).text_size(12).text_color(t.muted).flex().items_center()).child(p.title)))
@@ -85,10 +91,12 @@ export class Ask {
         .child(Input.new(this.input).h_full().text_size(13))))
       .when(Boolean(this.desc), (e) => e.child(div().h(120).rounded(7).border_1().border_color(t.input).overflow_hidden().child(Editor.new(this.desc).size_full()))
         .child(div().text_size(11).text_color(t.dim).child(p.descriptionHint ?? "enter commit · tab description · ctrl-enter commit from description · esc cancel")))
-      .child(v_flex().id("items").flex_shrink().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(28).flex_none().px(8).gap(10).items_center().rounded(6).cursor_pointer()
+      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(28).flex_none().px(8).gap(10).items_center().rounded(6).cursor_pointer()
         .when(n === this.sel, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
         .on_click(() => this.done(item.value))
         .child(div().min_w(18).flex_none().text_color(t.accent).text_size(12).child(item.key === "enter" ? "⏎" : item.key))
-        .child(div().flex_1().min_w(0).truncate().text_color(item.danger ? t.ansi1 : t.foreground).child(item.label)))));
+        .when(Boolean(item.hint), (e) => e.tooltip(item.hint))
+        .child(div().flex_1().min_w(0).truncate().text_color(item.danger ? t.ansi1 : t.foreground).child(item.label)))))
+      .child(explain());
   }
 }
