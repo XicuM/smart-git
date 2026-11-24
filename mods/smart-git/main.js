@@ -1392,7 +1392,8 @@ class Sidebar {
       const b = row.branch;
       return base.child(div().flex_none().w(10).text_color(t.accent).child(b.current ? "*" : ""))
         .child(name(b.name, b.current ? t.accent : t.foreground))
-        .when(Boolean(b.track), (e) => e.child(dim(b.track.replace("ahead ", "↑").replace("behind ", "↓").replace(", ", " "))))
+        .when(/ahead (\d+)/.test(b.track || ""), (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${b.track.match(/ahead (\d+)/)[1]}`)))
+        .when(/behind (\d+)/.test(b.track || ""), (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${b.track.match(/behind (\d+)/)[1]}`)))
         .child(dim(b.when.replace(/ ago$/, "")));
     }
     if (row.commit) {
