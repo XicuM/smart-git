@@ -2,7 +2,7 @@
 // (props.view "diff") and its own dialogs (props.view "ask").
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input } from "gpui-base";
-import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, checking } from "herdr";
+import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, terminals, checking } from "herdr";
 import {
   location, git, findRoot, writeThere, rebaseWith, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
   parseRemotes, parseRefs, parseReflog, LOG_FORMAT, BRANCH_FORMAT, REF_FORMAT, REFLOG_FORMAT,
@@ -72,6 +72,8 @@ export default class HerdrGit extends View {
         if (c === "focus") this.part.handle.focus();
         // `herdr-git.key:<k>` presses a key, for scripts and tests.
         else if (c.startsWith("key:")) this.part.key?.(c.slice(4), cx);
+        // e in the diff pane: the sidebar edits the file it has selected (the one the diff shows).
+        else if (c === "edit" && this.part.panel === "files") this.part.key("e", cx);
         cx.notify();
       }
     });
@@ -349,7 +351,40 @@ class Sidebar {
   w(args, opts) { return git(this.repo, args, { write: true, ...opts }); }
 
   // A command that needs a person (an editor, a password) in a terminal under the focused pane.
-  inTerminal(argv, folder = this.repo.root) { run("terminal.open", { argv, folder, place: "down" }); }
+  // The editor picked with E (if any) is the one git opens there.
+  inTerminal(argv, folder = this.repo.root) {
+    const ed = shared("herdr-git:editor");
+    run("terminal.open", { argv: argv && ed ? ["env", `GIT_EDITOR=${ed}`, ...argv] : argv, folder, place: "down" });
+  }
+
+  // The editor in a popup over the window: a terminal overlay closes itself when its
+  // terminal ends, so quitting the editor is all it takes to be back at the diff.
+  async edit(path, cx) {
+    const ed = shared("herdr-git:editor") ?? "${VISUAL:-${EDITOR:-micro}}";
+    const r = await hc(["run", "--bg", "--json", "--no-parent", "--rm", "--cwd", this.repo.root, ...(this.repo.on ? ["--on", this.repo.on] : []),
+      "--", "sh", "-c", `exec ${ed} "$1"`, "sh", path]);
+    if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim());
+    // The app hears of a new terminal a moment after hc starts it; an overlay opened before would close at once.
+    const t = JSON.parse(r.stdout).address;
+    for (let n = 0; n < 30 && !terminals().some((x) => x.address === t); n++) await cx.sleep(100);
+    // A click beside it doesn't close it (that would leave the editor running unseen); Esc goes to the editor.
+    openOverlay({ kind: "dialog", modal: true, width: 0.85, height: 0.85, layout: { type: "block", content: { terminal: t } } });
+  }
+
+  // E: which editor e, C and R open; only the ones installed are offered.
+  async pickEditor() {
+    const r = await exec("sh", ["-c", "for e in micro nano nvim vim vi hx emacs; do command -v $e >/dev/null && echo $e; done"], { on: this.repo.on });
+    const cur = shared("herdr-git:editor");
+    const items = r.stdout.split("\n").filter(Boolean).map((e, n) => ({ key: String(n + 1), label: e === cur ? `${e} ✓` : e, value: e }));
+    const pick = await ask({ title: "Editor", items: [...items,
+      { key: "c", label: "Custom command…", value: "custom" },
+      { key: "d", label: cur ? "Default ($VISUAL / $EDITOR)" : "Default ($VISUAL / $EDITOR) ✓", value: "default" }] });
+    if (!pick) return;
+    if (pick === "default") return setShared("herdr-git:editor", null);
+    if (pick !== "custom") return setShared("herdr-git:editor", pick);
+    const c = await ask({ title: "Editor command", input: { value: cur ?? "", placeholder: "e.g. code --wait" } });
+    if (c?.text.trim()) setShared("herdr-git:editor", c.text.trim());
+  }
 
   // Opens a page of the repo's forge (GitHub, GitLab, …) in the browser.
   async browse(path) {
@@ -585,7 +620,7 @@ class Sidebar {
           if (m) await this.w(["stash", "push", ...r, ...(m.text.trim() ? ["-m", m.text.trim()] : [])]);
         })],
         i: ["Ignore", () => row && act("Ignoring…", () => this.ignore(row))],
-        e: ["Edit in your editor", () => row?.file && this.inTerminal(["sh", "-c", 'exec ${VISUAL:-${EDITOR:-micro}} "$1"', "sh", row.file.path])],
+        e: ["Edit in your editor (E picks it)", () => row?.file && act("Opening editor…", (cx) => this.edit(row.file.path, cx))],
         o: ["Open with the default app", () => row?.file && !this.repo.on && exec("xdg-open", [`${this.repo.root}/${row.file.path}`])],
         "`": ["Tree / flat list", () => { this.tree = !this.tree; setShared("herdr-git:tree", this.tree); this.select("files", 0, cx); }],
         // Collapsing all needs every folder, nested ones too: list them with nothing collapsed.
@@ -940,6 +975,7 @@ class Sidebar {
       f: ["Fetch all remotes", () => act("Fetching…", () => this.remote(["fetch", "--all", "--prune"]))],
       z: ["Undo (reflog)", () => act("Undoing…", () => this.undo())],
       R: ["Refresh", () => this.refresh(cx)],
+      E: ["Choose editor…", () => act("…", () => this.pickEditor())],
       // lazygit's "menu of what I can do here": the right-click menu, from the keyboard.
       x: () => this.menu(cx),
       "?": () => this.menu(cx, true),
