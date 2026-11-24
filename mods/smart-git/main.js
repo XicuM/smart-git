@@ -1,10 +1,10 @@
-// herdr-git: lazygit's side panels as a herdr sidebar. The same mod draws the diff pane
+// Smart Git: lazygit's side panels as a herdr sidebar. The same mod draws the diff pane
 // (props.view "diff") and its own dialogs (props.view "ask").
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input } from "gpui-base";
-import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, terminals, checking } from "herdr";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea } from "gpui-base";
+import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, closeOverlay, terminals, checking, agents, knownAgents } from "herdr";
 import {
-  location, git, findRoot, writeThere, rebaseWith, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
+  perf, location, git, findRoot, writeThere, rebaseWith, openEditor, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
   parseRemotes, parseRefs, parseReflog, LOG_FORMAT, BRANCH_FORMAT, REF_FORMAT, REFLOG_FORMAT,
 } from "./git.js";
 import { Diff } from "./diff.js";
@@ -12,6 +12,38 @@ import { ask, confirm, keyOf, Ask } from "./ask.js";
 
 const ROW = 26, HEAD = 30;
 const seen = new Map();
+// The commit box's unsent subject and description, per repo.
+const drafts = new Map();
+// How each agent in Herdr's table (knownAgents keys) answers one prompt and exits: its arguments
+// ("{prompt}" where the prompt goes), the flag that picks a model, its models (a list, or the arguments
+// that print them), and the fast model Auto uses. The program is the agent's own `run`, so a
+// programs.json override is kept. Agents not here get "Set up…" (saved in smart-git:recipes).
+const RECIPES = {
+  claude: { args: ["-p", "{prompt}"], model: "--model", models: ["haiku", "sonnet", "opus", "fable"], fast: "haiku" },
+  codex: { args: ["exec", "{prompt}"], model: "-m" },
+  opencode: { args: ["run", "{prompt}"], model: "-m", list: ["models"] },
+  copilot: { args: ["-p", "{prompt}"], model: "--model" },
+  cursor: { args: ["-p", "{prompt}"], model: "--model", list: ["models"] },
+  grok: { args: ["-p", "{prompt}"], model: "-m", list: ["models"] },
+  pi: { args: ["-p", "{prompt}"], model: "--model" },
+  omp: { args: ["-p", "{prompt}"], model: "--model" },
+  antigravity: { args: ["-p", "{prompt}"], model: "--model", list: ["models"] },
+  amp: { args: ["-x", "{prompt}"] },
+  gemini: { args: ["-p", "{prompt}"], model: "-m" },
+  goose: { args: ["run", "-t", "{prompt}"] },
+  crush: { args: ["run", "{prompt}"] },
+  kiro: { args: ["chat", "--no-interactive", "{prompt}"] },
+};
+// Menu keys for long lists.
+const KEYS = "123456789abcdefghijklmnopqrstuvwxyz";
+// A CLI's model list: the first word of each line that looks like a model id (has a digit, - or /).
+const modelIds = (text) => [...new Set(text.split("\n").map((l) => /^\s*[*•-]?\s*([\w.\/:@-]+)/.exec(l)?.[1]).filter((m) => m && /[\d\/-]/.test(m) && !m.endsWith(":")))];
+const PROMPT = `Write a git commit for the changes below.
+
+Reply with ONE JSON object and nothing else (no markdown, no code fences):
+{"subject": "one-line conventional-commit subject, imperative mood, max 72 chars, no trailing period", "body": "optional description: 1-3 sentences or bullet lines on what changed and why, \\n between lines; empty if the subject says it all"}
+
+`;
 const icon = (name) => svg(`mods/workspace-chrome/${name}.svg`);
 // Status is the title bar; the rest are the sidebar's sections, each with lazygit's tabs.
 const PANELS = [
@@ -62,18 +94,28 @@ const EXPLAIN = {
 // The git dir, those files, and the todo of a rebase in progress.
 const STATE = 'd=$(git rev-parse --absolute-git-dir) || exit 0; echo "$d"; cd "$d"; for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$f" ] && echo "$f"; done; [ -f rebase-merge/git-rebase-todo ] && { echo "--todo"; cat rebase-merge/git-rebase-todo; }; true';
 
+// The editor popup's title bar. x ends the editor, and the popup closes with its terminal.
+const editBar = () => {
+  const p = props(), t = theme();
+  return h_flex().id("smart-git-editbar").size_full().px(12).gap(8).items_center().bg(t.popover).border_b_1().border_color(t.border).text_size(12)
+    .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(p.title))
+    .child(div().flex_none().text_color(t.dim).child(p.editor))
+    .child(div().id("close").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover))
+      .tooltip("Close the editor").on_click(() => { hc(["kill", p.terminal]); closeOverlay(p.overlay); }).child(icon("x").size(14)));
+};
+
 export default class HerdrGit extends View {
   init(_props, cx) {
     const view = props()?.view;
-    this.part = view === "diff" ? new Diff(this, cx) : view === "ask" ? new Ask(cx) : new Sidebar(cx);
-    if (view !== "ask" && !checking()) cx.spawn(async (cx) => {
+    this.part = view === "diff" ? new Diff(this, cx) : view === "ask" ? new Ask(cx) : view === "editbar" ? { render: editBar } : new Sidebar(cx);
+    if (view !== "ask" && view !== "editbar" && !checking()) cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
         if (c === "focus") this.part.handle.focus();
-        // `herdr-git.key:<k>` presses a key, for scripts and tests.
+        // From the diff: the sidebar takes the keyboard, then presses the key it passed on (`sidebar:2`).
+        else if (c.startsWith("sidebar")) { if (this.part.panel) { this.part.handle.focus(); if (c[7] === ":") this.part.key(c.slice(8), cx); } }
+        // `smart-git.key:<k>` presses a key, for scripts and tests.
         else if (c.startsWith("key:")) this.part.key?.(c.slice(4), cx);
-        // e in the diff pane: the sidebar edits the file it has selected (the one the diff shows).
-        else if (c === "edit" && this.part.panel === "files") this.part.key("e", cx);
         cx.notify();
       }
     });
@@ -86,16 +128,25 @@ class Sidebar {
   constructor(cx) {
     this.handle = cx.focus_handle();
     this.scrolls = Object.fromEntries(PANELS.map((p) => [p.id, VirtualListScrollHandle.new()]));
-    this.folded = new Set(shared("herdr-git:folded") ?? []);
-    this.tabs = { status: "status", files: "files", branches: "branches", commits: "commits", stash: "stash", ...(shared("herdr-git:tabs") ?? {}) };
+    this.folded = new Set(shared("smart-git:folded") ?? []);
+    this.tabs = { status: "status", files: "files", branches: "branches", commits: "commits", stash: "stash", ...(shared("smart-git:tabs") ?? {}) };
     this.stack = []; this.panel = "files"; this.collapsed = new Set(); this.copied = [];
-    this.tree = shared("herdr-git:tree") ?? true;
+    this.tree = shared("smart-git:tree") ?? true;
     this.clear();
+    // The commit box. While one of its fields has the keyboard (`typing`), the list's keys are off.
+    this.subject = InputState.new({ placeholder: "Commit message" });
+    this.body = TextareaState.new({ placeholder: "Description" }); this.body.set_auto_grow(2, 6);
+    for (const [name, s] of [["subject", this.subject], ["body", this.body]]) {
+      s.on("focus", (_e, cx) => { this.typing = name; cx.notify(); });
+      s.on("blur", (_e, cx) => { if (this.typing === name) this.typing = null; cx.notify(); });
+    }
+    this.subject.on("submit", (_e, cx) => this.act("Committing…", () => this.commit(), cx));
+    this.subject.on("change", (_e, cx) => cx.notify());
     this.filter = InputState.new({ placeholder: "Filter" });
     this.filter.on("change", (_e, cx) => { this.filterText = this.filter.value(); this.sel[this.filterView] = 0; cx.notify(); });
     this.filter.on("submit", (_e, cx) => { this.filtering = false; this.handle.focus(); cx.notify(); });
     this.filterText = "";
-    this.bump = shared("herdr-git:bump");
+    this.bump = shared("smart-git:bump");
     // The folder watch keeps a local repo current; the timer is for remote ones (and a watch that failed).
     cx.timer.every(10000, (cx) => { if (!this.watching) this.refresh(cx); });
   }
@@ -137,6 +188,9 @@ class Sidebar {
   go(stack, cx) {
     const key = (st) => JSON.stringify(st), keep = ["head", "files", "branches", "commits", "stash", "submodules", "worktrees", "remotes", "remoteBranches", "tags", "reflog", "ops", "todo", "gitDir", "sel", "inRemote", "stamp", "raw"];
     if (this.stack.length) seen.set(key(this.stack), Object.fromEntries(keep.map((k) => [k, this[k]])));
+    if (this.stack.length) drafts.set(key(this.stack), [this.subject.value(), this.body.value()]);
+    const [subject = "", body = ""] = drafts.get(key(stack)) ?? [];
+    this.subject.set_value(subject); this.body.set_value(body);
     this.stack = stack;
     this.error = stack.length ? null : "Not a git repository";
     const old = seen.get(key(stack));
@@ -149,18 +203,23 @@ class Sidebar {
     if (this.watching === repo?.root) return;
     this.watchCall?.cancel(); this.watching = null;
     if (!repo || repo.on) return;
+    // A token, not the root: going A→B→A while a loop sleeps mustn't leave two loops on A.
+    const token = this.watchToken = {};
     this.watching = repo.root;
     cx.spawn(async (cx) => {
       try {
-        while (this.watching === repo.root) {
+        while (this.watchToken === token) {
           this.watchCall = watchFolder(repo.root);
           const changed = await this.watchCall;
           // A save or an agent's edit comes as a burst of changes: refresh once it settles. The refresh
           // reads git after the wait, so changes during it are in it.
           if (changed.length) await cx.sleep(300);
-          if (this.watching === repo.root && changed.length) this.refresh(cx);
+          if (this.watchToken !== token || !changed.length) continue;
+          // A file edited again leaves `git status` the same: `edits` still has the diff reload it.
+          if (changed.some((p) => !p.includes("/.git/") && !p.endsWith("/.git"))) this.edits = (this.edits ?? 0) + 1;
+          this.refresh(cx); this.show(cx);
         }
-      } catch { if (this.watching === repo.root) this.watching = null; }
+      } catch { if (this.watchToken === token) this.watching = null; }
     });
   }
 
@@ -238,8 +297,9 @@ class Sidebar {
   }
 
   fileTree(q) {
+    // A path can be both deleted in the index and untracked (two entries): ids must stay unique or the list draws nothing.
     const files = this.files.filter((f) => !q || f.path.toLowerCase().includes(q));
-    if (!this.tree) return files.map((f) => ({ id: f.path, file: f, depth: 0, name: f.path, text: f.path }));
+    if (!this.tree) return files.map((f) => ({ id: f.untracked ? f.path + "?" : f.path, file: f, depth: 0, name: f.path, text: f.path }));
     // The tree: a folder row before its files, folders with a single child folder joined.
     const root = { dirs: new Map(), files: [] };
     for (const f of files) {
@@ -256,7 +316,7 @@ class Sidebar {
         out.push({ id: path + "/", dir: path, depth, name: label, files: inside, text: path });
         if (!this.collapsed.has(path)) walk(n, path + "/", depth + 1);
       }
-      for (const f of node.files.sort((a, b) => a.path.localeCompare(b.path))) out.push({ id: f.path, file: f, depth, name: f.path.slice(prefix.length), text: f.path });
+      for (const f of node.files.sort((a, b) => a.path.localeCompare(b.path))) out.push({ id: f.untracked ? f.path + "?" : f.path, file: f, depth, name: f.path.slice(prefix.length), text: f.path });
     };
     walk(root, "", 0);
     return out;
@@ -276,8 +336,9 @@ class Sidebar {
 
   // Tells the diff pane what's selected.
   show(cx) {
-    const row = this.current(), repo = this.repo;
-    if (!row || !repo) return;
+    // An empty list still tells the diff: committing everything mustn't leave the old file shown.
+    const row = this.current() ?? {}, repo = this.repo;
+    if (!repo) return;
     const files = row.file ? [row.file] : row.files, ref = this.refOf(row);
     const short = (r) => /^[0-9a-f]{40}$/.test(r) ? r.slice(0, 7) : r;
     let s;
@@ -294,30 +355,31 @@ class Sidebar {
     else if (row.remote) s = { kind: "remote", name: row.remote.name, title: `Branches of ${row.remote.name}` };
     else if (row.sub && row.sub.state !== "-") s = { kind: "status", title: `${row.sub.path}: all branches`, repo: { root: `${repo.root}/${row.sub.path}`, on: repo.on } };
     else s = { kind: "status", title: "All branches" };
-    // A folder's untracked files can't share one `diff --no-index`: show the tracked changes.
-    if (row.dir && files.every((f) => f.untracked)) s = { ...s, unstaged: true, untracked: false };
-    // Sent once the selection rests: every setShared redraws every mod and the diff runs git,
-    // so a held arrow key sends only where it stops.
-    this.next = { repo, ...s, stamp: s.kind === "file" || s.kind === "conflict" ? this.stamp : undefined };
-    if (this.sending) return;
-    this.sending = true;
+    // A folder's untracked files can't share one `diff --no-index`: the diff runs one per file (50 at most).
+    if (row.dir) { const news = files.filter((f) => f.untracked).map((f) => f.path); if (news.length) s = { ...s, news: news.slice(0, 50) }; }
+    // Sent once the selection rests 60 ms: every setShared redraws every mod and the diff runs git,
+    // so a held arrow key sends only where it stops. `edits` reloads a file edited again.
+    this.next = { repo, ...s, stamp: s.kind === "file" || s.kind === "conflict" ? [this.stamp, this.edits ?? 0] : undefined };
+    const gen = this.sendGen = (this.sendGen ?? 0) + 1;
     cx.timer.after(60, () => {
-      this.sending = false;
-      if (JSON.stringify(this.next) !== JSON.stringify(shared("herdr-git:show"))) setShared("herdr-git:show", this.next);
+      if (gen !== this.sendGen) return;
+      const t0 = Date.now(); // PERF
+      if (JSON.stringify(this.next) !== JSON.stringify(shared("smart-git:show"))) setShared("smart-git:show", this.next);
+      perf("setShared show", t0); // PERF
     });
   }
 
   // The diff pane beside the focused tab's panes, opened once.
   ensureDiff(cx) {
     const tab = focused()?.tab;
-    if (!tab || panes().some((p) => p.tab === tab && p.mod === "herdr-git")) return;
-    run("pane.split", { direction: "right", mod: "herdr-git", props: { view: "diff" } });
+    if (!tab || panes().some((p) => p.tab === tab && p.mod === "smart-git")) return;
+    run("pane.split", { direction: "right", mod: "smart-git", props: { view: "diff" } });
     cx.spawn(async (cx) => { await cx.sleep(150); this.handle.focus(); cx.notify(); });
   }
 
   // Enter: the diff pane zoomed to the whole tab (its Esc brings the layout back).
   focusDiff() {
-    const tab = focused()?.tab, pane = panes().find((p) => p.tab === tab && p.mod === "herdr-git");
+    const tab = focused()?.tab, pane = panes().find((p) => p.tab === tab && p.mod === "smart-git");
     if (pane) run(pane.zoomed ? "pane.focus" : "pane.zoom", { pane: pane.pane });
   }
 
@@ -325,14 +387,14 @@ class Sidebar {
     this.panel = panel;
     const view = this.view, rows = this.rows(view);
     this.sel[view] = Math.max(0, Math.min(index, rows.length - 1));
-    if (this.folded.delete(panel)) setShared("herdr-git:folded", [...this.folded]);
+    if (this.folded.delete(panel)) setShared("smart-git:folded", [...this.folded]);
     this.scrolls[panel].scroll_to_item(this.sel[view]);
     this.show(cx); this.ensureDiff(cx); cx.notify();
   }
 
   setTab(panel, tab, cx) {
     if (tab !== "remotes") this.inRemote = null;
-    this.tabs[panel] = tab; setShared("herdr-git:tabs", this.tabs);
+    this.tabs[panel] = tab; setShared("smart-git:tabs", this.tabs);
     if (tab === "submodules") this.refresh(cx);
     this.select(panel, this.sel[this.viewOf(panel)] ?? 0, cx);
   }
@@ -353,37 +415,25 @@ class Sidebar {
   // A command that needs a person (an editor, a password) in a terminal under the focused pane.
   // The editor picked with E (if any) is the one git opens there.
   inTerminal(argv, folder = this.repo.root) {
-    const ed = shared("herdr-git:editor");
+    const ed = shared("smart-git:editor");
     run("terminal.open", { argv: argv && ed ? ["env", `GIT_EDITOR=${ed}`, ...argv] : argv, folder, place: "down" });
   }
 
-  // The editor in a popup over the window: a terminal overlay closes itself when its
-  // terminal ends, so quitting the editor is all it takes to be back at the diff.
-  async edit(path, cx) {
-    const ed = shared("herdr-git:editor") ?? "${VISUAL:-${EDITOR:-micro}}";
-    const r = await hc(["run", "--bg", "--json", "--no-parent", "--rm", "--cwd", this.repo.root, ...(this.repo.on ? ["--on", this.repo.on] : []),
-      "--", "sh", "-c", `exec ${ed} "$1"`, "sh", path]);
-    if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim());
-    // The app hears of a new terminal a moment after hc starts it; an overlay opened before would close at once.
-    const t = JSON.parse(r.stdout).address;
-    for (let n = 0; n < 30 && !terminals().some((x) => x.address === t); n++) await cx.sleep(100);
-    // A click beside it doesn't close it (that would leave the editor running unseen); Esc goes to the editor.
-    openOverlay({ kind: "dialog", modal: true, width: 0.85, height: 0.85, layout: { type: "block", content: { terminal: t } } });
-  }
+  edit(path, cx, line) { return openEditor(this.repo, path, line, cx); }
 
   // E: which editor e, C and R open; only the ones installed are offered.
   async pickEditor() {
     const r = await exec("sh", ["-c", "for e in micro nano nvim vim vi hx emacs; do command -v $e >/dev/null && echo $e; done"], { on: this.repo.on });
-    const cur = shared("herdr-git:editor");
+    const cur = shared("smart-git:editor");
     const items = r.stdout.split("\n").filter(Boolean).map((e, n) => ({ key: String(n + 1), label: e === cur ? `${e} ✓` : e, value: e }));
     const pick = await ask({ title: "Editor", items: [...items,
       { key: "c", label: "Custom command…", value: "custom" },
       { key: "d", label: cur ? "Default ($VISUAL / $EDITOR)" : "Default ($VISUAL / $EDITOR) ✓", value: "default" }] });
     if (!pick) return;
-    if (pick === "default") return setShared("herdr-git:editor", null);
-    if (pick !== "custom") return setShared("herdr-git:editor", pick);
+    if (pick === "default") return setShared("smart-git:editor", null);
+    if (pick !== "custom") return setShared("smart-git:editor", pick);
     const c = await ask({ title: "Editor command", input: { value: cur ?? "", placeholder: "e.g. code --wait" } });
-    if (c?.text.trim()) setShared("herdr-git:editor", c.text.trim());
+    if (c?.text.trim()) setShared("smart-git:editor", c.text.trim());
   }
 
   // Opens a page of the repo's forge (GitHub, GitLab, …) in the browser.
@@ -415,15 +465,50 @@ class Sidebar {
     if (tracked.length) await this.w(["restore", "--source=HEAD", "--staged", "--worktree", "--", ...tracked]);
   }
 
+  // Commits with the commit box's subject and description; with nothing staged, everything (after asking).
   async commit({ noVerify = false } = {}) {
+    const subject = this.subject.value().trim(), body = this.body.value().trim();
+    if (!subject) return this.subject.focus();
     if (!this.files.some((f) => f.staged)) {
       if (!this.files.length) throw new Error("Nothing to commit");
       if (!await confirm("No files staged", "Stage all files and commit?", "Stage all and commit", false)) return;
       await this.w(["add", "-A"]);
     }
-    const r = await ask({ title: noVerify ? "Commit (skip hooks)" : "Commit", input: { placeholder: "Summary" }, description: true });
-    if (!r?.text.trim()) return;
-    await this.w(["commit", "-m", r.text.trim(), ...(r.description.trim() ? ["-m", r.description.trim()] : []), ...(noVerify ? ["--no-verify"] : [])], { timeout: 120000 });
+    await this.w(["commit", "-m", subject, ...(body ? ["-m", body] : []), ...(noVerify ? ["--no-verify"] : [])], { timeout: 120000 });
+    this.subject.set_value(""); this.body.set_value(""); this.handle.focus();
+  }
+
+  // I: an agent CLI writes the commit box's subject and description from the staged changes
+  // (everything, when nothing is staged).
+  async generate() {
+    if (!this.files.length) throw new Error("Nothing to commit");
+    const cmd = shared("smart-git:agent") ?? await this.pickAgent();
+    if (!cmd) return;
+    const staged = this.files.some((f) => f.staged);
+    let diff = await git(this.repo, ["diff", "--no-color", "--no-ext-diff", staged ? "--cached" : "HEAD"]).catch(() => "");
+    if (diff.length > 10000) diff = diff.slice(0, 10000) + "\n\n[... diff truncated ...]";
+    const files = this.files.filter((f) => !staged || f.staged).map((f) => `${f.x}${f.y} ${f.path}`).join("\n");
+    const r = await exec("sh", ["-c", `${cmd} "$1"`, "sh", `${PROMPT}Files:\n${files}\n\nDiff:\n${diff}`], { cwd: this.repo.root, on: this.repo.on, timeout: 180000 });
+    let m = null;
+    try { m = JSON.parse(/\{[\s\S]*\}/.exec(r.stdout)?.[0]); } catch {}
+    if (!m?.subject) throw new Error(`${cmd.split(" ")[0]} wrote no commit message: ${(r.stderr.trim() || r.stdout.trim()).slice(-300)}`);
+    this.subject.set_value(m.subject.trim()); this.body.set_value(String(m.body ?? "").trim());
+    this.subject.focus();
+  }
+
+  // ctrl-i (or right-click ✨): which agent CLI writes commit messages; only installed ones are offered.
+  async pickAgent() {
+    const r = await exec("sh", ["-c", "for c in claude codex opencode; do command -v $c >/dev/null && echo $c; done"], { on: this.repo.on });
+    const have = r.stdout.split("\n"), cur = shared("smart-git:agent");
+    const items = AGENTS.filter(([, cmd]) => have.includes(cmd.split(" ")[0]))
+      .map(([name, cmd], n) => ({ key: String(n + 1), label: cmd === cur ? `${name} ✓` : name, value: cmd, hint: cmd }));
+    const pick = await ask({ title: "Agent for commit messages", items: [...items,
+      { key: "c", label: "Custom command…", value: "custom", hint: "Any CLI that prints its answer, the prompt as its last argument." }] });
+    if (!pick) return null;
+    const cmd = pick !== "custom" ? pick
+      : (await ask({ title: "Agent command", detail: "The prompt is added as its last argument.", input: { value: cur ?? "", placeholder: "e.g. llm -m gpt-4o-mini" } }))?.text.trim();
+    if (cmd) setShared("smart-git:agent", cmd);
+    return cmd || null;
   }
 
   async ignore(row) {
@@ -449,7 +534,7 @@ class Sidebar {
   // A changed submodule back to the commit its parent records, its own changes stashed.
   async resetSub(path) {
     if (!await confirm(`Reset submodule ${path}?`, "Its uncommitted changes are stashed (in the submodule), and it goes back to the commit this repo records.", "Reset submodule")) return;
-    await git({ root: `${this.repo.root}/${path}`, on: this.repo.on }, ["stash", "push", "--include-untracked", "-m", "herdr-git: submodule reset"], { write: true });
+    await git({ root: `${this.repo.root}/${path}`, on: this.repo.on }, ["stash", "push", "--include-untracked", "-m", "smart-git: submodule reset"], { write: true });
     await this.w(["submodule", "update", "--init", "--force", "--recursive", "--", path], { timeout: 300000 });
   }
 
@@ -533,6 +618,8 @@ class Sidebar {
     const index = PANELS.findIndex((p) => p.id === this.panel);
     const move = (n) => this.select(this.panel, i + n, cx);
     const act = (label, work) => this.act(label, work, cx);
+    const changed = row?.file ? [row.file] : row?.files ?? [];
+    const stages = changed.some((f) => f.unstaged), stagesAll = this.files.some((f) => f.unstaged);
     const ref = this.refOf(row), short = row?.commit?.short ?? row?.reflog?.short ?? ref;
     const remoteOf = (name) => [name.slice(0, name.indexOf("/")), name.slice(name.indexOf("/") + 1)];
     const copy = ["Copy name", () => ref && cx.write_to_clipboard(ref)];
@@ -547,17 +634,19 @@ class Sidebar {
     };
     const panelKeys = {
       files: {
-        space: ["Stage / unstage", () => row && act(row.file?.staged && !row.file?.unstaged ? "Unstaging…" : "Staging…", () => this.toggleStage(row))],
+        space: [stages ? "Stage" : "Unstage", () => row && act(stages ? "Staging…" : "Unstaging…", () => this.toggleStage(row))],
         enter: [row?.file?.sub ? "Open submodule" : row?.dir ? "Fold folder" : "View diff (stage lines)", () => {
           if (row?.dir) { this.collapsed.has(row.dir) ? this.collapsed.delete(row.dir) : this.collapsed.add(row.dir); }
           else if (row?.file?.sub) this.enter(row.file.path, cx);
           else this.focusDiff();
         }],
-        a: ["Stage / unstage all", () => act("Staging all…", () => this.files.some((f) => f.unstaged) ? this.w(["add", "-A"]) : this.w(["reset", "-q"]))],
-        c: ["Commit", () => act("Committing…", () => this.commit())],
+        a: [stagesAll ? "Stage all" : "Unstage all", () => act(stagesAll ? "Staging all…" : "Unstaging all…", () => stagesAll ? this.w(["add", "-A"]) : this.w(["reset", "-q"]))],
+        "|1": null,
+        c: ["Write commit message", () => this.subject.focus()],
+        I: ["Write it with AI", () => act("Writing message…", () => this.generate())],
         w: ["Commit without hooks", () => act("Committing…", () => this.commit({ noVerify: true }))],
         C: ["Commit in your editor", () => this.inTerminal(["git", "commit"])],
-        A: ["Amend last commit", () => act("Amending…", async () => {
+        A: ["Amend last commit…", () => act("Amending…", async () => {
           const r = await ask({ title: "Amend last commit", detail: this.commits[0]?.subject, items: [
             { key: "enter", label: "Amend with staged changes", value: "noedit" },
             { key: "r", label: "Amend and reword…", value: "reword" },
@@ -568,14 +657,15 @@ class Sidebar {
             if (m?.text.trim()) await this.w(["commit", "--amend", "-m", m.text.trim(), ...(m.description.trim() ? ["-m", m.description.trim()] : [])]);
           }
         })],
-        d: [row?.file?.sub ? "Reset submodule" : "Discard changes", () => row && act("Discarding…", async () => {
+        "|2": null,
+        d: [row?.file?.sub ? "Reset submodule" : "Discard…", () => row && act("Discarding…", async () => {
           if (row.file?.sub) return this.resetSub(row.file.path);
           const files = row.file ? [row.file] : row.files, items = [{ key: "x", label: "Discard all changes", value: "all", danger: true }];
           if (files.some((f) => f.staged) && files.some((f) => f.unstaged && !f.untracked)) items.push({ key: "u", label: "Discard unstaged changes", value: "unstaged", danger: true });
           const r = await ask({ title: `Discard ${row.file?.path ?? row.dir + "/"}`, items });
           if (r) await this.discard(row, r === "unstaged");
         })],
-        D: ["Reset options", () => act("Resetting…", async () => {
+        D: ["Reset…", () => act("Resetting…", async () => {
           const up = this.head.upstream;
           const r = await ask({ title: "Reset", items: [
             { key: "x", label: "Nuke working tree (reset --hard, clean -fd)", value: "nuke", danger: true },
@@ -594,7 +684,7 @@ class Sidebar {
           else if (r === "unstage") await this.w(["reset", "-q"]);
           else if (r) await this.w(["reset", r, "-q", up]);
         })],
-        M: ["Resolve conflict…", () => row?.file?.conflict && act("Resolving…", async () => {
+        ...(row?.file?.conflict ? { M: ["Resolve conflict…", () => act("Resolving…", async () => {
           const p = row.file.path;
           const r = await ask({ title: `Resolve ${p}`, detail: "enter on the file picks conflict by conflict in the diff pane.", items: [
             { key: "o", label: "Keep ours (the checked out side)", value: "--ours" },
@@ -603,12 +693,13 @@ class Sidebar {
           ] });
           if (r === "tool") return this.inTerminal(["git", "mergetool", "--", p]);
           if (r) { await this.w(["checkout", r, "--", p]); await this.w(["add", "--", p]); }
-        })],
-        s: ["Stash all changes", () => act("Stashing…", async () => {
+        })] } : {}),
+        "|3": null,
+        s: ["Stash all changes…", () => act("Stashing…", async () => {
           const r = await ask({ title: "Stash all changes", input: { placeholder: "Stash message (optional)" } });
           if (r) await this.w(["stash", "push", "--include-untracked", ...(r.text.trim() ? ["-m", r.text.trim()] : [])]);
         })],
-        S: ["Stash options", () => act("Stashing…", async () => {
+        S: ["Stash some…", () => act("Stashing…", async () => {
           const r = await ask({ title: "Stash", items: [
             { key: "a", label: "Stash all changes", value: ["--include-untracked"] },
             { key: "i", label: "Stash all changes and keep index", value: ["--include-untracked", "--keep-index"] },
@@ -619,12 +710,16 @@ class Sidebar {
           const m = await ask({ title: "Stash message", input: { placeholder: "Optional" } });
           if (m) await this.w(["stash", "push", ...r, ...(m.text.trim() ? ["-m", m.text.trim()] : [])]);
         })],
-        i: ["Ignore", () => row && act("Ignoring…", () => this.ignore(row))],
-        e: ["Edit in your editor (E picks it)", () => row?.file && act("Opening editor…", (cx) => this.edit(row.file.path, cx))],
-        o: ["Open with the default app", () => row?.file && !this.repo.on && exec("xdg-open", [`${this.repo.root}/${row.file.path}`])],
-        "`": ["Tree / flat list", () => { this.tree = !this.tree; setShared("herdr-git:tree", this.tree); this.select("files", 0, cx); }],
+        "|4": null,
+        ...(row?.file ? {
+          e: ["Open in your editor", () => act("Opening editor…", (cx) => this.edit(row.file.path, cx))],
+          ...(this.repo.on ? {} : { o: ["Open with the default app", () => exec("xdg-open", [`${this.repo.root}/${row.file.path}`])] }),
+        } : {}),
+        i: ["Add to .gitignore", () => row && act("Ignoring…", () => this.ignore(row))],
+        "|5": null,
+        "`": [this.tree ? "Show as a flat list" : "Show as a tree", () => { this.tree = !this.tree; setShared("smart-git:tree", this.tree); this.select("files", 0, cx); }],
         // Collapsing all needs every folder, nested ones too: list them with nothing collapsed.
-        "-": ["Collapse all folders", () => {
+        ...(this.tree ? { "-": ["Collapse all folders", () => {
           const id = row?.id;
           this.collapsed = new Set();
           this.collapsed = new Set(this.rows("files").filter((r) => r.dir).map((r) => r.dir));
@@ -634,12 +729,13 @@ class Sidebar {
           const id = row?.id;
           this.collapsed = new Set();
           this.select("files", Math.max(0, this.rows("files").findIndex((r) => r.id === id)), cx);
-        }],
+        }] } : {}),
       },
       worktrees: {
         enter: ["Switch to this worktree", () => row && this.go([{ root: row.id, on: this.repo.on }], cx)],
-        space: ["Switch to this worktree", () => row && this.go([{ root: row.id, on: this.repo.on }], cx)],
+        space: () => row && this.go([{ root: row.id, on: this.repo.on }], cx),
         o: ["Open a terminal there", () => row && this.inTerminal(undefined, row.id)],
+        "|11": null,
         n: ["New worktree", () => act("Creating worktree…", async () => {
           const r = await ask({ title: "New worktree", detail: "A branch to check out, or a new one (from HEAD).", input: { placeholder: "Branch" } });
           const b = r?.text.trim();
@@ -667,6 +763,16 @@ class Sidebar {
           return git(repo, args, { write: true, timeout: 300000 }).catch((e) => this.remoteFailed(e, ["-C", repo.root, ...args]));
         })],
         i: ["Init", () => row && act("Initializing…", () => git(this.subRepo(row.sub), ["submodule", "init", "--", row.sub.rel], { write: true }))],
+        b: ["All submodules…", () => act("Updating submodules…", async () => {
+          const r = await ask({ title: "All submodules", items: [
+            { key: "i", label: "Init all", value: ["submodule", "init"] },
+            { key: "u", label: "Update all (recursively)", value: ["submodule", "update", "--init", "--recursive"] },
+            { key: "s", label: "Sync URLs (recursively)", value: ["submodule", "sync", "--recursive"] },
+            { key: "d", label: "Deinit all", value: ["submodule", "deinit", "--all", "-f"], danger: true },
+          ] });
+          if (r) await this.remote(r);
+        })],
+        "|13": null,
         n: ["Add submodule", () => act("Adding submodule…", async () => {
           const u = await ask({ title: "Add submodule", input: { placeholder: "Repository URL" } });
           if (!u?.text.trim()) return;
@@ -689,15 +795,7 @@ class Sidebar {
           const dir = (await git(repo, ["rev-parse", "--git-path", `modules/${row.sub.name}`])).trim();
           await exec("rm", ["-rf", "--", dir], { cwd: repo.root, on: repo.on });
         })],
-        b: ["All submodules…", () => act("Updating submodules…", async () => {
-          const r = await ask({ title: "All submodules", items: [
-            { key: "i", label: "Init all", value: ["submodule", "init"] },
-            { key: "u", label: "Update all (recursively)", value: ["submodule", "update", "--init", "--recursive"] },
-            { key: "s", label: "Sync URLs (recursively)", value: ["submodule", "sync", "--recursive"] },
-            { key: "d", label: "Deinit all", value: ["submodule", "deinit", "--all", "-f"], danger: true },
-          ] });
-          if (r) await this.remote(r);
-        })],
+        "|15": null,
         y: ["Copy path", () => row && cx.write_to_clipboard(row.id)],
         o: ["Open a terminal in it", () => row && this.inTerminal(undefined, `${this.repo.root}/${row.id}`)],
       },
@@ -709,6 +807,7 @@ class Sidebar {
           if (r?.text.trim()) await this.w(["checkout", r.text.trim()]);
         })],
         "-": ["Check out previous", () => act("Checking out previous…", () => this.w(["checkout", "-"]))],
+        "|16": null,
         n: ["New branch from here", () => this.newBranch(row?.branch.name ?? "HEAD", cx)],
         d: ["Delete", () => row && !row.branch.current && act(`Deleting ${row.id}…`, async () => {
           if (!await confirm(`Delete branch ${row.id}?`, row.branch.subject, "Delete")) return;
@@ -722,7 +821,9 @@ class Sidebar {
           const r = await ask({ title: `Rename ${row.id}`, input: { value: row.id } });
           if (r?.text.trim() && r.text.trim() !== row.id) await this.w(["branch", "-m", row.id, r.text.trim().replace(/\s+/g, "-")]);
         })],
+        "|17": null,
         ...(row?.branch?.current ? {} : mergeRebase),
+        "|18": null,
         u: ["Upstream…", () => row && act("Setting upstream…", async () => {
           const b = row.branch;
           const r = await ask({ title: `Upstream of ${b.name}`, detail: b.upstream || "None", items: [
@@ -741,6 +842,7 @@ class Sidebar {
           const [remote, branch] = remoteOf(up);
           await this.remote(["fetch", remote, `${branch}:${row.id}`]);
         })],
+        "|19": null,
         y: copy,
         o: ["Open in the browser", () => row && act("Opening…", () => this.browse(`tree/${row.branch.upstream ? remoteOf(row.branch.upstream)[1] : row.id}`))],
         W: diffAgainst,
@@ -748,6 +850,7 @@ class Sidebar {
       remotes: {
         enter: ["Show its branches", () => { if (row) { this.inRemote = row.id; this.select("branches", 0, cx); } }],
         f: ["Fetch", () => row && act(`Fetching ${row.id}…`, () => this.remote(["fetch", row.id]))],
+        "|20": null,
         n: ["Add remote", () => act("Adding remote…", async () => {
           const n = await ask({ title: "New remote", input: { placeholder: "Name", value: this.remotes.length ? "" : "origin" } });
           if (!n?.text.trim()) return;
@@ -774,6 +877,7 @@ class Sidebar {
           await this.w(this.branches.some((b) => b.name === local) ? ["checkout", local] : ["checkout", "-b", local, "--track", row.id]);
         })],
         enter: ["View log", () => this.focusDiff()],
+        "|21": null,
         n: ["New branch from here", () => this.newBranch(row?.id ?? "HEAD", cx)],
         ...mergeRebase,
         u: ["Set as upstream of the current branch", () => row && act("Setting upstream…", () => this.w(["branch", "--set-upstream-to", row.id]))],
@@ -781,6 +885,7 @@ class Sidebar {
           const [remote, branch] = remoteOf(row.id);
           if (await confirm(`Delete ${branch} on ${remote}?`, row.rbranch.subject, "Delete remote branch")) await this.remote(["push", remote, "--delete", branch]);
         })],
+        "|24": null,
         y: copy,
         o: ["Open in the browser", () => row && act("Opening…", () => this.browse(`tree/${remoteOf(row.id)[1]}`))],
         W: diffAgainst,
@@ -790,6 +895,7 @@ class Sidebar {
           if (await confirm(`Check out ${row.id}?`, "You'll be on a detached HEAD.", "Check out", false)) await this.w(["checkout", "--detach", row.id]);
         })],
         enter: ["View log", () => this.focusDiff()],
+        "|25": null,
         n: ["New tag at HEAD", () => this.tagAt("HEAD", "HEAD", cx)],
         d: ["Delete", () => row && act(`Deleting ${row.id}…`, async () => {
           const r = await ask({ title: `Delete tag ${row.id}`, items: [
@@ -805,17 +911,21 @@ class Sidebar {
             : await ask({ title: `Push ${row.id} to`, items: this.remotes.map((rm, n) => ({ key: String(n + 1), label: rm.name, value: rm.name })) });
           if (r) await this.remote(["push", r, `refs/tags/${row.id}`]);
         })],
+        "|26": null,
         y: copy,
         W: diffAgainst,
       },
       commits: row?.todo ? {
         // A rebase in progress: change what's still to come.
+        enter: ["View commit", () => this.focusDiff()],
+        "|29": null,
         p: ["Pick", () => this.setTodo(row, "pick", cx)],
         s: ["Squash into the one below", () => this.setTodo(row, "squash", cx)],
         f: ["Fixup into the one below", () => this.setTodo(row, "fixup", cx)],
         e: ["Edit (stop there)", () => this.setTodo(row, "edit", cx)],
         d: ["Drop", () => act("Dropping…", () => this.editTodo((t) => t.splice(row.n, 1)))],
         // The list shows the todo upside down: down is earlier in it.
+        "|28": null,
         "ctrl-j": ["Move down", () => row.n > 0 && act("Moving…", async () => {
           await this.editTodo((t) => { [t[row.n - 1], t[row.n]] = [t[row.n], t[row.n - 1]]; });
           this.sel.commits = i + 1;
@@ -824,22 +934,22 @@ class Sidebar {
           await this.editTodo((t) => { [t[row.n + 1], t[row.n]] = [t[row.n], t[row.n + 1]]; });
           this.sel.commits = i - 1;
         })],
-        enter: ["View commit", () => this.focusDiff()],
       } : {
         enter: ["View commit (select lines to move)", () => this.focusDiff()],
         space: ["Check out", () => row && act(`Checking out ${short}…`, async () => {
           if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false, EXPLAIN.commits.space)) await this.w(["checkout", "--detach", row.id]);
         })],
         g: ["Reset to this commit…", () => row && act("Resetting…", () => this.resetTo(row.id, short, row.commit.subject))],
+        "|30": null,
         r: ["Reword", () => row && act("Rewording…", async () => {
           const body = (await git(this.repo, ["log", "-1", "--format=%b", row.id])).trim();
           const m = await ask({ title: `Reword ${short}`, detail: EXPLAIN.commits.r, input: { value: row.commit.subject }, description: true, descriptionValue: body });
           if (!m?.text.trim()) return;
           const msg = [m.text.trim(), ...(m.description.trim() ? ["-m", m.description.trim()] : [])];
           if (row.id === this.head.oid) return this.w(["commit", "--amend", "--only", "--no-verify", "-m", ...msg]);
-          const file = `${this.gitDir}/herdr-git-msg`, w = await writeThere(this.repo, file, m.text.trim() + (m.description.trim() ? "\n\n" + m.description.trim() : "") + "\n");
+          const file = `${this.gitDir}/smart-git-msg`, w = await writeThere(this.repo, file, m.text.trim() + (m.description.trim() ? "\n\n" + m.description.trim() : "") + "\n");
           if (w.code !== 0) throw new Error(w.stderr.trim());
-          await this.rewrite(row.id, (t) => t.splice(1, 0, { action: "exec", rest: `git commit --amend --only --no-verify -F '${file}'` }));
+          await this.rewrite(row.id, (t) => t.splice(1, 0, { action: "exec", rest: `git commit --amend --only --no-verify -F '${file.replace(/'/g, "'\\''")}'` }));
         })],
         R: ["Reword in your editor", () => row && this.inTerminal(row.id === this.head.oid
           ? ["git", "commit", "--amend", "--only"]
@@ -855,6 +965,7 @@ class Sidebar {
         })],
         e: ["Edit (stop at it)", () => row?.commit && act("Starting rebase…", () => this.rewrite(row.id, (t) => { t[0].action = "edit"; }))],
         i: ["Interactive rebase from here", () => row?.commit && act("Starting rebase…", () => this.rewrite(row.id, (t) => t.unshift({ action: "break", rest: "" })))],
+        "|32": null,
         "ctrl-j": ["Move down", () => row?.commit && act("Moving…", async () => {
           await this.rewrite(`${row.id}^`, (t) => { if (t.length < 2) throw new Error("Nothing below to move past"); [t[0], t[1]] = [t[1], t[0]]; });
           this.sel.commits = i + 1;
@@ -863,6 +974,7 @@ class Sidebar {
           await this.rewrite(row.id, (t) => { if (t.length < 2) throw new Error("Already the newest"); [t[0], t[1]] = [t[1], t[0]]; });
           this.sel.commits = Math.max(0, i - 1);
         })],
+        "|33": null,
         A: ["Amend with staged changes", () => row?.commit && act("Amending…", async () => {
           if (!this.files.some((f) => f.staged)) throw new Error("Stage the changes to amend with first");
           if (row?.id === this.head.oid) return this.w(["commit", "--amend", "--no-edit", "--no-verify"]);
@@ -875,8 +987,10 @@ class Sidebar {
         t: ["Revert", () => row && act("Reverting…", async () => {
           if (await confirm(`Revert ${short}?`, row.commit.subject, "Revert", false, EXPLAIN.commits.t)) await this.w(["revert", "--no-edit", row.id], { timeout: 120000 });
         })],
+        "|35": null,
         C: ["Copy for cherry-pick", () => row && this.toggleCopy(row.id, short)],
         V: ["Paste (cherry-pick) copied commits", () => this.paste(cx)],
+        "|36": null,
         n: ["New branch from here", () => row && this.newBranch(row.id, cx, short)],
         T: ["Tag", () => row && this.tagAt(row.id, short, cx)],
         b: ["Bisect…", () => row && act("Bisecting…", async () => {
@@ -896,6 +1010,7 @@ class Sidebar {
           const r = await ask({ title: "Show the commits touching", input: { placeholder: "path/to/file-or-folder", value: f?.file?.path ?? f?.dir ?? "" } });
           if (r?.text.trim()) this.pathFilter = r.text.trim();
         })],
+        "|38": null,
         y: ["Copy…", () => row && act("Copying…", async (cx) => {
           const r = await ask({ menu: true, title: "Copy", items: [
             { key: "h", label: "Hash", value: "%H" }, { key: "s", label: "Short hash", value: "%h" }, { key: "m", label: "Subject", value: "%s" },
@@ -914,18 +1029,22 @@ class Sidebar {
           if (await confirm(`Check out ${short}?`, "You'll be on a detached HEAD.", "Check out", false, EXPLAIN.reflog.space)) await this.w(["checkout", "--detach", row.reflog.hash]);
         })],
         g: ["Reset to this…", () => row && act("Resetting…", () => this.resetTo(row.reflog.hash, short, row.reflog.subject))],
+        "|39": null,
         C: ["Copy for cherry-pick", () => row && this.toggleCopy(row.reflog.hash, short)],
         V: ["Paste (cherry-pick) copied commits", () => this.paste(cx)],
+        "|40": null,
         n: ["New branch from here", () => row && this.newBranch(row.reflog.hash, cx, short)],
         y: ["Copy hash", () => row && cx.write_to_clipboard(row.reflog.hash)],
         W: diffAgainst,
       },
       stash: {
+        enter: ["View", () => this.focusDiff()],
         space: ["Apply", () => row && act("Applying stash…", () => this.w(["stash", "apply", row.id]))],
         g: ["Pop", () => row && act("Popping stash…", () => this.w(["stash", "pop", row.id]))],
         d: ["Drop", () => row && act("Dropping stash…", async () => {
           if (await confirm(`Drop ${row.id}?`, row.stash.subject, "Drop", true, "Deletes this stash and the changes saved in it.")) await this.w(["stash", "drop", row.id]);
         })],
+        "|42": null,
         n: ["New branch from this stash", () => row && act("Creating branch…", async () => {
           const r = await ask({ title: `Branch from ${row.id}`, input: { placeholder: "Branch name" } });
           if (r?.text.trim()) await this.w(["stash", "branch", r.text.trim().replace(/\s+/g, "-"), row.id]);
@@ -937,7 +1056,6 @@ class Sidebar {
           await this.w(["stash", "drop", row.id]);
           await this.w(["stash", "store", "-m", r.text.trim(), hash]);
         })],
-        enter: ["View", () => this.focusDiff()],
       },
       status: { enter: ["View all branches", () => this.focusDiff()] },
     };
@@ -966,16 +1084,21 @@ class Sidebar {
         this.busy = `${OPS[busy]}…`;
         await this.w([cmd, r], { timeout: 120000 });
       })] } : {}),
+      "|44": null,
       "/": ["Filter this list", () => {
         if (this.filterView !== view) { this.filter.set_value(""); this.filterText = ""; this.filterView = view; }
         this.filtering = true; this.filter.focus();
       }],
+      "|45": null,
       p: ["Pull", () => act("Pulling…", () => this.remote(["pull"]))],
       P: ["Push", () => act("Pushing…", () => this.push())],
       f: ["Fetch all remotes", () => act("Fetching…", () => this.remote(["fetch", "--all", "--prune"]))],
+      "|46": null,
       z: ["Undo (reflog)", () => act("Undoing…", () => this.undo())],
       R: ["Refresh", () => this.refresh(cx)],
+      "|47": null,
       E: ["Choose editor…", () => act("…", () => this.pickEditor())],
+      "ctrl-i": ["Choose AI commit agent…", () => act("…", () => this.pickAgent())],
       // lazygit's "menu of what I can do here": the right-click menu, from the keyboard.
       x: () => this.menu(cx),
       "?": () => this.menu(cx, true),
@@ -1025,7 +1148,13 @@ class Sidebar {
   menu(cx, all = false) {
     const { panel, global } = this.actions(cx);
     const row = this.current(), explain = EXPLAIN[row?.todo ? "todo" : this.view] ?? {};
-    const items = Object.entries(all ? { ...panel, ...global } : panel).filter(([, a]) => Array.isArray(a)).map(([key, [label]]) => ({ key, label, value: key, hint: panel[key] ? explain[key] : undefined }));
+    // A null entry ("|1", "|2"…) is a line between groups; one is dropped where a group came out empty.
+    const items = [];
+    for (const [key, a] of Object.entries(all ? { ...panel, "|panel": null, ...global } : panel)) {
+      if (Array.isArray(a)) items.push({ key, label: a[0], value: key, hint: panel[key] ? explain[key] : undefined });
+      else if (a === null && items.length && !items.at(-1).sep) items.push({ sep: true });
+    }
+    if (items.at(-1)?.sep) items.pop();
     if (!items.length) return;
     cx.spawn(async (cx) => {
       const k = await ask({ menu: !all, title: all ? "Keys" : row?.name ?? row?.text ?? null, items });
@@ -1034,10 +1163,14 @@ class Sidebar {
   }
 
   key(k, cx) {
+    const t0 = Date.now(); // PERF
     const { panel, global } = this.actions(cx);
+    perf(`key ${k} actions()`, t0); // PERF
     const a = panel[k] ?? global[k];
     if (!a) return false;
+    const t1 = Date.now(); // PERF
     (Array.isArray(a) ? a[1] : a)();
+    perf(`key ${k} handler`, t1); this.keyAt = Date.now(); // PERF
     cx.notify();
     return true;
   }
@@ -1103,14 +1236,15 @@ class Sidebar {
     return base.child(dim(row.stash.ref.replace("stash@", ""))).child(name(row.stash.subject));
   }
 
-  render(cx) {
+  render(cx) { const t0 = Date.now(), r = this.render2(cx); perf(`sidebar render${this.keyAt ? ` (${t0 - this.keyAt}ms after key)` : ""}`, t0); this.keyAt = 0; return r; } // PERF
+  render2(cx) { // PERF
     this.follow(cx);
     // The diff pane changed something (a line staged, a conflict resolved).
-    if (shared("herdr-git:bump") !== this.bump) { this.bump = shared("herdr-git:bump"); this.refresh(cx); }
+    if (shared("smart-git:bump") !== this.bump) { this.bump = shared("smart-git:bump"); this.refresh(cx); }
     const t = theme(), focused = this.handle.is_focused(), h = this.head;
     const toggle = (id, cx) => {
       this.folded.has(id) ? this.folded.delete(id) : this.folded.add(id);
-      setShared("herdr-git:folded", [...this.folded]); cx.notify();
+      setShared("smart-git:folded", [...this.folded]); cx.notify();
     };
     // The title bar: where you are (submodules as a breadcrumb), the branch, and what's running.
     const title = h_flex().h(42).flex_none().px(14).gap(4).items_center().border_b(1).border_color(t.border)
@@ -1155,7 +1289,7 @@ class Sidebar {
         }))
         .child(div().id(`fold-${p.id}`).flex_1().min_w(0).h_full().flex().items_center().gap(6).cursor_pointer().on_click((_e, cx) => toggle(p.id, cx))
           .child(div().flex_1().min_w(0).truncate().font_normal().text_size(11).text_color(t.dim).child(open ? "" : this.summary(view)))
-          .child(div().flex_none().text_size(10.5).text_color(active ? t.accent : t.dim).child(String(n)))
+          .child(div().flex_none().text_size(10.5).text_color(active && focused ? t.accent : t.dim).child(String(n)))
           .child(icon(open ? "chevron-down" : "chevron-right").size(11).flex_none().text_color(t.dim)));
       const el = v_flex().when(n > 2, (e) => e.border_t(1).border_color(t.border)).child(header);
       if (!open) return el.flex_none();
@@ -1186,16 +1320,46 @@ class Sidebar {
               })))
           .child(Scrollbar.vertical(`list-${p.id}`).viewport_from_layout().absolute().inset_0()));
     };
-    return v_flex().id("herdr-git").size_full().min_h(0).overflow_hidden().rounded(10).border_1().border_color(t.border)
+    // The commit box, as VS Code's: one card, the subject with ✨ (an agent writes it, right-click picks
+    // the agent) and ✓ (commit), and the description under it once there's a subject (or one already).
+    const writingAi = this.busy === "Writing message…", hasSubject = Boolean(this.subject.value().trim());
+    const tool = (id, tip, on, enabled = true) => div().id(id).size(24).flex_none().flex().items_center().justify_center().rounded(5)
+      .text_color(enabled ? t.muted : t.dim).tooltip(tip)
+      .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => { on(cx); cx.notify(); }));
+    const agent = shared("smart-git:agent"), named = AGENTS.find(([, cmd]) => cmd === agent)?.[0] ?? agent;
+    const box = v_flex().id("commit-box").mx(10).mt(8).mb(6).flex_none().rounded(8).border_1().overflow_hidden().text_size(12.5)
+      .border_color(this.typing ? t.accent : t.border).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(h_flex().h(32).pl(10).pr(3).gap(1).items_center()
+        .child(div().flex_1().min_w(0).h_full().child(Input.new(this.subject).h_full().text_size(12.5)))
+        .child(tool("ai", writingAi ? "Writing the message…" : `Write the message with ${named ?? "an agent"} (I) · right-click to choose`,
+          (cx) => this.act("Writing message…", () => this.generate(), cx), !this.busy)
+          .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.act("…", () => this.pickAgent(), cx); })
+          .child(writingAi ? div().text_color(t.working).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90) : svg("mods/smart-git/sparkles.svg").size(13)))
+        .child(tool("commit", "Commit (enter, ctrl-enter from the description)", (cx) => this.act("Committing…", () => this.commit(), cx), hasSubject && !this.busy)
+          .child(svg("mods/workspace-chrome/check.svg").size(14))))
+      .when(hasSubject || this.typing === "body" || Boolean(this.body.value()), (e) => e.child(div().border_t(1).border_color(t.border).pl(10).pr(8).py(6)
+        .child(Textarea.new(this.body).w_full().text_size(12.5))));
+    return v_flex().id("smart-git").size_full().min_h(0).overflow_hidden().rounded(10).border_1().border_color(t.border)
       .bg(t.background).text_color(t.foreground).text_size(13)
       .track_focus(this.handle)
       .on_key_down((e, cx) => {
+        // In the commit box: ctrl-enter commits, tab goes to the description, esc back to the list.
+        if (this.typing) {
+          const k = keyOf(e);
+          if (k === "ctrl-enter" || k === "cmd-enter") this.act("Committing…", () => this.commit(), cx);
+          else if (k === "tab" && this.typing === "subject") this.body.focus();
+          else if (k === "shift-tab" && this.typing === "body") this.subject.focus();
+          else if (k === "escape") this.handle.focus();
+          else return;
+          cx.stop_propagation(); cx.notify(); return;
+        }
         if (this.filtering && e.key === "escape") { this.filtering = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); return; }
         if (this.filtering && !this.handle.is_focused()) return;
         if (this.key(keyOf(e), cx)) cx.stop_propagation();
       })
       .on_mouse_down("left", (_e, cx) => { this.handle.focus(); cx.notify(); })
       .child(title)
+      .when(!this.error && Boolean(this.repo), (e) => e.child(box))
       .children(banners.map(banner))
       .when(Boolean(this.error) || !this.repo, (e) => e.child(div().flex_1().px(14).py(12).text_size(12).text_color(t.dim).child(this.error ?? "")))
       .when(!this.error && Boolean(this.repo), (e) => e.child(v_flex().flex_1().min_h(0).children(PANELS.slice(1).map((p, n) => section(p, n + 2)))))
@@ -1218,7 +1382,7 @@ class Sidebar {
   // A short, per-section line of the keys you reach for most; ? lists the rest.
   hints() {
     const keys = {
-      files: "space stage · a stage all · c commit · d discard · s stash",
+      files: "space stage · a stage all · c message · I AI message · d discard",
       worktrees: "space switch · n new · o terminal · d remove",
       submodules: "enter open · u update · n add · d remove",
       branches: "space check out · n new · M merge · r rebase · d delete",

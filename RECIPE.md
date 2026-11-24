@@ -1,8 +1,8 @@
-# herdr-git
+# Smart Git
 
 lazygit's side panels as a Herdr sidebar, plus a diff pane that opens beside your terminals. You get one card with a title bar (repo and branch), then Files, Branches, Commits and Stash sections, each with lazygit's tabs (Worktrees, Submodules, Remotes, Tags, Reflog). Pick a row and the diff appears in a pane next to the shell; every lazygit action (stage, commit, rebase, cherry-pick, bisect, submodules) is a key on the focused list or a right-click menu.
 
-![herdr-git](preview.png)
+![Smart Git](preview.png)
 
 ## What you see
 
@@ -18,7 +18,7 @@ lazygit's side panels as a Herdr sidebar, plus a diff pane that opens beside you
    - Reflog, Stash (`{n}` then subject), Tags (name, subject, age), Remotes (name, url; enter opens its branches), Worktrees (`*` on the one you are in, branch, `~` path), Submodules (state mark, nested ones indented, `not checked out` in `dim`).
 5. A red note line (click to dismiss) when an action fails; a 10.5px `dim` hint line at the bottom with the first six keys of the current list and `? all keys`.
 
-**Diff pane**, a normal Herdr pane titled `herdr-git`: a header with the selection's title and two icon buttons (wrap, split/unified), a virtualized, scrollable list of 20px rows, and a hint line. Unified by default, side by side with `s`. Green/red added/removed lines, `@@` hunk headers, file headers, and for a branch a `git log --graph`. Shows "Select something in the git panel" until something is selected.
+**Diff pane**, a normal Herdr pane titled `smart-git`: a header with the selection's title and two icon buttons (wrap, split/unified), a virtualized, scrollable list of 20px rows, and a hint line. Unified by default, side by side with `s`. Green/red added/removed lines, `@@` hunk headers, file headers, and for a branch a `git log --graph`. Shows "Select something in the git panel" until something is selected.
 
 ## How it behaves
 
@@ -35,23 +35,23 @@ lazygit's side panels as a Herdr sidebar, plus a diff pane that opens beside you
   - Everywhere: `p` pull, `P` push, `f` fetch all, `z` undo from reflog, `R` refresh, `m` continue/abort an operation in progress. Destructive actions ask first.
 - **Diff pane keys** (focused): `j/k` line, `g/G` ends, `v` range, `a` hunk, `s` split/unified, `w` wrap, `ctrl-w` ignore whitespace, `{`/`}` context lines (default 3), `S` submodule log/diff, `z` zoom, `esc`/`q`/`h` back to the sidebar. On a file: `space` stages/unstages the selected lines or hunk, `d` discards them. On a commit: `space` moves the selected lines out of it. On a conflicted file: `j/k` next conflict, `h/l` ours/theirs, `space`/`enter` take it, `b` both, `z` undo.
 - Agent statuses are not used by this mod; it only reacts to git state.
-- State shared across copies: folded sections, active tabs, tree/flat, split/wrap/whitespace/context (`herdr-git:*` shared keys), so the sidebar and diff pane agree and survive restarts.
+- State shared across copies: folded sections, active tabs, tree/flat, split/wrap/whitespace/context (`smart-git:*` shared keys), so the sidebar and diff pane agree and survive restarts.
 
 ## Built from
 
-Files in `mods/herdr-git/`:
+Files in `mods/smart-git/`:
 - `mod.json`: `{ "place": "none", "title": "git", "focusable": true }`. `focusable` lets `pane.go` reach it and sends `"focus"` through `nextCommand()`.
 - `main.js` (default `HerdrGit extends View`): `init` picks a part by `props().view`: `"diff"` → `Diff`, `"ask"` → `Ask` (dialogs), otherwise `Sidebar`. Sidebar holds the `PANELS` table, one action table `actions(cx)` per list (used by keys, right-click menus, `?` and the hint line), `follow`, `refresh` (parallel `git` reads, status via `STATE` shell snippet for rebase/merge/bisect markers), and `render`.
-- `diff.js`: `Diff` part, one `v_virtual_list` of rows from `diffRows`/`splitRows`; selection arrives through `shared("herdr-git:show")`; line staging builds a patch with `partialPatch` and applies it; conflicts via `parseConflicts`.
+- `diff.js`: `Diff` part, one `v_virtual_list` of rows from `diffRows`/`splitRows`; selection arrives through `shared("smart-git:show")`; line staging builds a patch with `partialPatch` and applies it; conflicts via `parseConflicts`.
 - `git.js`: `location()`, `git(repo, args, {write, timeout, env})` (reads add `--no-optional-locks` and disable fsmonitor/auto-refresh so a refresh never triggers the folder watch; every call is `env GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true git …`), `writeThere` (writes via `sh -c 'printf %s "$1" > "$2"'` in 30000-char pieces), `findRoot`, `parse*` for status v2, log, branches, submodules, worktrees, remotes, refs, reflog, stash, and `rebaseWith` (a `GIT_SEQUENCE_EDITOR` that applies one change to a todo).
-- `ask.js`: `ask(spec)` opens `openOverlay({mod:"herdr-git", kind:"popup"|"dialog", props:{view:"ask", id, ...spec}})` and resolves a promise from module scope; `confirm`; `keyOf(event)` spells keys the lazygit way (`a`, `A`, `space`, `ctrl-d`). Specs: `{items:[{key,label,value,danger}], menu, title, detail, input, description}`; menus are 300px wide, dialogs 460px.
-- Icons: `align-left.svg`, `columns-2.svg`, `rows-2.svg`, `wrap-text.svg` (14px, `svg("mods/herdr-git/<name>.svg")`) for the diff header; chevron-right, chevron-down and git-branch come from the shipped `mods/workspace-chrome/*.svg`.
+- `ask.js`: `ask(spec)` opens `openOverlay({mod:"smart-git", kind:"popup"|"dialog", props:{view:"ask", id, ...spec}})` and resolves a promise from module scope; `confirm`; `keyOf(event)` spells keys the lazygit way (`a`, `A`, `space`, `ctrl-d`). Specs: `{items:[{key,label,value,danger}], menu, title, detail, input, description}`; menus are 300px wide, dialogs 460px.
+- Icons: `align-left.svg`, `columns-2.svg`, `rows-2.svg`, `wrap-text.svg` (14px, `svg("mods/smart-git/<name>.svg")`) for the diff header; chevron-right, chevron-down and git-branch come from the shipped `mods/workspace-chrome/*.svg`.
 
-From `gpui-kit`/`gpui-base`: `View, div, svg, v_flex, h_flex, Scrollbar, ScrollHandle, InputState, Input, EditorState, Editor, v_virtual_list, VirtualListScrollHandle`. From `herdr`: `props, panes, focused, spaces, theme, settings, run, shared, setShared, watchFolder, nextCommand, exec, checking, openOverlay, closeOverlay`. Commands: `pane.split {direction:"right", mod:"herdr-git", props:{view:"diff"}}`, `pane.zoom`, `pane.focus`, `pane.go {direction:"right"}`, `terminal.open {argv, folder, place:"down"}` (editor, mergetool, interactive things).
+From `gpui-kit`/`gpui-base`: `View, div, svg, v_flex, h_flex, Scrollbar, ScrollHandle, InputState, Input, EditorState, Editor, v_virtual_list, VirtualListScrollHandle`. From `herdr`: `props, panes, focused, spaces, theme, settings, run, shared, setShared, watchFolder, nextCommand, exec, checking, openOverlay, closeOverlay`. Commands: `pane.split {direction:"right", mod:"smart-git", props:{view:"diff"}}`, `pane.zoom`, `pane.focus`, `pane.go {direction:"right"}`, `terminal.open {argv, folder, place:"down"}` (editor, mergetool, interactive things).
 
 Programs run (`exec`): `git`, `env`, `sh`, `cat`, `rm`, and `xdg-open` (opens the forge page of the remote in the browser). Nothing else reaches the network except what `git pull/push/fetch/submodule` does. Reads files only through git and the repo it follows.
 
-To show it: put a block `{ "id": "changes", "type": "block", "content": { "mod": "herdr-git" } }` where the shipped Changes panel sits (for example as a child of the `panel-body` stack in a cloned `main` layout), or open it with `mod.open:herdr-git` / `tab.new {mod:"herdr-git"}`. There is no `keys.json`: keys are handled while the mod has focus.
+To show it: put a block `{ "id": "changes", "type": "block", "content": { "mod": "smart-git" } }` where the shipped Changes panel sits (for example as a child of the `panel-body` stack in a cloned `main` layout), or open it with `mod.open:smart-git` / `tab.new {mod:"smart-git"}`. There is no `keys.json`: keys are handled while the mod has focus.
 
 ## Watch out
 
@@ -65,13 +65,13 @@ To show it: put a block `{ "id": "changes", "type": "block", "content": { "mod":
 - `watchFolder` is local only; remote repos rely on the 10 second timer. On Linux a tree with more than 4096 non-ignored folders rejects the watch: the timer covers it.
 - Never keep a `cx` across awaits; each callback gets its own. No `setTimeout`: use `cx.timer.after/every`. In `init`, `if (checking()) return;` before starting the command loop.
 - Assumes `git` (2.25+ for `restore`), `sh`, `env` and, for "open in browser", `xdg-open` on the machine the space runs on; the shipped `workspace-chrome` mod for three icons; a Linux/macOS shell. The app writes `gpui-kit.d.ts` and `jsconfig.json` into the mod folder: they are not part of the mod.
-- Key presses meant for a test (`herdr-app do herdr-git.key:<k>`) go to the copy **shown now**, which may be a real repo in another space. Don't send `space` or `d` to a live window.
+- Key presses meant for a test (`herdr-app do smart-git.key:<k>`) go to the copy **shown now**, which may be a real repo in another space. Don't send `space` or `d` to a live window.
 
 ## Done when
 
-- `herdr-app check mods/herdr-git` passes.
+- `herdr-app check mods/smart-git` passes.
 - In a repo with a change, the sidebar shows the repo name, the branch chip, Files with the change, Branches, Commits (300 at most per fetch is fine) and Stash, all open, with section numbers 2-5.
-- Arrow down to a file: a `herdr-git` pane opens right of the terminal showing its diff; arrow to a commit: the commit's patch; to a branch: its graph log.
+- Arrow down to a file: a `smart-git` pane opens right of the terminal showing its diff; arrow to a commit: the commit's patch; to a branch: its graph log.
 - `space` on a file stages it (status column turns green, `git diff --cached` agrees); `space` again unstages it. `c` opens a popup; typing a summary and Enter makes the commit and the Commits list gains it at the top.
 - `enter` on a file zooms the diff; `v` then `j` selects lines; `space` stages only those (`git diff --cached` shows just them); `esc` returns to the sidebar and the layout is restored.
 - Right-click on a commit opens a popup of commit actions; `r` reword, `g` reset menu, `C` then `V` on another branch cherry-picks.

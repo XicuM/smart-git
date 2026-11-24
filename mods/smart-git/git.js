@@ -1,5 +1,8 @@
 // Git for every view: where the repo is, running git there, and reading its output.
-import { spaces, panes, focused, exec } from "herdr";
+import { spaces, panes, focused, exec, hc, shared, terminals, openOverlay } from "herdr";
+let perfFlush = false; // PERF
+const PERF_LOG = [], PERF_ID = Math.random().toString(36).slice(2, 6); // PERF
+export const perf = (label, t0) => { PERF_LOG.push(`${Date.now() % 100000} ${label} ${Date.now() - t0}ms`); if (perfFlush) return; perfFlush = true; Promise.resolve().then(async () => { await new Promise((r) => r()); perfFlush = false; exec("sh", ["-c", 'printf %s "$1" > "$2"', "sh", PERF_LOG.slice(-400).join("\n") + "\n", "/tmp/claude-1000/-home-xicu-Projects-herdr/ce091be5-dee9-4fa3-ad26-0ba984492e9b/scratchpad/perf-" + PERF_ID + ".log"], {}).catch(() => {}); }); }; // PERF
 
 // The focused pane's folder and machine (as the shipped Changes panel finds them).
 // A focused mod pane (the diff) stands for a terminal of its tab; in a tab with none,
@@ -7,23 +10,28 @@ import { spaces, panes, focused, exec } from "herdr";
 export function location() {
   const space = spaces().find((s) => s.active), f = focused();
   let pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
-  const guess = Boolean(pane && !pane.terminal && !panes().some((p) => p.tab === pane.tab && p.terminal));
+  // Nothing with a folder focused (an empty tab) is a guess too.
+  const guess = Boolean(pane && !pane.terminal && !panes().some((p) => p.tab === pane.tab && p.terminal)) || (!pane && !f?.cwd);
   if (pane && !pane.terminal) pane = panes().find((p) => p.tab === pane.tab && p.terminal) ?? null;
-  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  // A layout or overlay terminal names its machine; anything else is on the space's.
+  const on = f?.pane === null && f.terminal ? (f.terminal.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id, guess };
 }
 
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
 // the folder watch would see it, and every refresh would start the next one.
 // Diffs always say a/ and b/ (a personal diff.mnemonicPrefix or noprefix would break patches).
-const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.noprefix=false"];
+// Paths come unquoted (core.quotePath), so "año.txt" stays readable and gaps can `git show` it.
+const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "-c", "diff.autoRefreshIndex=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.noprefix=false"];
 
 // `repo` is { root, on }. Reads by default; `write: true` for commands that change things.
 // Never prompts: a password or passphrase it would need is an error, and the caller
 // offers to run the command in a terminal instead.
 // `env` adds variables ("GIT_SEQUENCE_EDITOR=…").
 export async function git(repo, args, { write = false, timeout = 30000, env = [] } = {}) {
+  const t0 = Date.now(); // PERF
   const r = await exec("env", ["GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true", ...env, "git", ...(write ? [] : READ), ...args], { cwd: repo.root, on: repo.on, timeout });
+  perf(`git ${args.slice(0, 2).join(" ")}`, t0); // PERF
   // `diff --no-index` exits 1 when the files differ, which is what it's asked for.
   if (r.code !== 0 && !(r.code === 1 && args.includes("--no-index"))) throw new Error((r.stderr || r.stdout || `git ${args[0]} failed`).trim());
   return r.stdout;
@@ -38,6 +46,27 @@ export async function writeThere(repo, path, text) {
     if (r.code !== 0) break;
   }
   return r;
+}
+
+// The editor in a popup over the window: a terminal overlay closes itself when its
+// terminal ends, so quitting the editor is all it takes to be back. Both the sidebar and
+// the diff pane open it, so neither needs the other shown.
+// `line`: open there (the line selected in the diff); helix takes file:line, the rest +line.
+export async function openEditor(repo, path, line, cx) {
+  const ed = shared("smart-git:editor") ?? "${VISUAL:-${EDITOR:-micro}}";
+  const at = !line ? [path] : /(^|\/)hx\b/.test(ed) ? [`${path}:${line}`] : [`+${line}`, path];
+  // An editor that can't start (126/127) would close the popup at once: say so and wait instead.
+  const script = `${ed} "$@"; s=$?; [ $s -lt 126 ] || { printf '%s\\n' "Couldn't start the editor (exit $s). E in smart-git picks another. Enter closes this."; read -r _; }`;
+  const r = await hc(["run", "--bg", "--json", "--no-parent", "--rm", "--cwd", repo.root, ...(repo.on ? ["--on", repo.on] : []),
+    "--", "sh", "-c", script, "sh", ...at]);
+  if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim());
+  // The app hears of a new terminal a moment after hc starts it; an overlay opened before would close at once.
+  const t = JSON.parse(r.stdout).address;
+  for (let n = 0; n < 30 && !terminals().some((x) => x.address === t); n++) await cx.sleep(100);
+  // A click beside it doesn't close it (that would leave the editor running unseen); Esc goes to the editor.
+  openOverlay({ kind: "dialog", modal: true, width: 0.85, height: 0.85, layout: { type: "column", children: [
+    { type: "block", size: { px: 34 }, content: { mod: "smart-git", props: { view: "editbar", title: line ? `${path}:${line}` : path, editor: ed.startsWith("$") ? "" : ed, terminal: t } } },
+    { type: "block", content: { terminal: t } }] } });
 }
 
 export async function findRoot(cwd, on) {
@@ -167,10 +196,10 @@ export async function rebaseWith(repo, hash, change, { autosquash = false } = {}
   if (change) {
     const todo = (await git(repo, ["log", "--reverse", "--format=%H %s", range])).split("\n").filter(Boolean).map((rest) => ({ action: "pick", rest }));
     change(todo);
-    const file = `${(await git(repo, ["rev-parse", "--absolute-git-dir"])).trim()}/herdr-git-todo`;
+    const file = `${(await git(repo, ["rev-parse", "--absolute-git-dir"])).trim()}/smart-git-todo`;
     const r = await writeThere(repo, file, todo.map((t) => `${t.action} ${t.rest}`.trim()).join("\n") + "\n");
     if (r.code !== 0) throw new Error(r.stderr.trim());
-    editor = `cp '${file}'`;
+    editor = `cp '${file.replace(/'/g, "'\\''")}'`;
   }
   return git(repo, ["rebase", "-i", "--autostash", autosquash ? "--autosquash" : "--no-autosquash", ...(root ? ["--root"] : [`${hash}^`])],
     { write: true, timeout: 120000, env: [`GIT_SEQUENCE_EDITOR=${editor}`] });
@@ -215,7 +244,7 @@ export function parseConflicts(text) {
     if (!c && l.startsWith("<<<<<<<")) { parts.push(plain); plain = []; c = { ours: [], base: null, theirs: [], side: "ours", head: l, tail: "" }; continue; }
     if (c) {
       if (c.side === "ours" && l.startsWith("|||||||")) { c.base = []; c.mid = l; c.side = "base"; continue; }
-      if (c.side !== "theirs" && l === "=======") { c.side = "theirs"; continue; }
+      if (c.side !== "theirs" && l.replace(/\r$/, "") === "=======") { c.side = "theirs"; continue; }
       if (c.side === "theirs" && l.startsWith(">>>>>>>")) { c.tail = l; parts.push(c); c = null; continue; }
       c[c.side].push(l); continue;
     }

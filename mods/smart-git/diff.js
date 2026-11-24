@@ -5,7 +5,7 @@ import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { shared, theme, settings, run, setShared, exec, panes, focused } from "herdr";
 import { ask, keyOf } from "./ask.js";
-import { git, writeThere, rebaseWith, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
+import { perf, git, writeThere, rebaseWith, openEditor, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
 
 const ROW = 20, CHAR = 7.3;
 const BANDS = ["s", "f", "@", "g", "h", "<", "|", "=", ">"];
@@ -34,6 +34,7 @@ function sources(s, o) {
   if (s.kind === "file") {
     const out = [], path = ["--", s.path];
     if (s.unstaged) out.push(["Unstaged changes", s.untracked ? ["diff", "--no-index", ...flags, "--", "/dev/null", s.path] : ["diff", ...flags, ...path]]);
+    for (const p of s.news ?? []) out.push(["Untracked files", ["diff", "--no-index", ...flags, "--", "/dev/null", p]]);
     if (s.staged) out.push(["Staged changes", ["diff", "--cached", ...flags, ...path]]);
     return out;
   }
@@ -68,8 +69,8 @@ const conflictText = (parts) => parts.flatMap((p) => Array.isArray(p) ? p
 export class Diff {
   constructor(view, cx) {
     this.view = view; this.rows = []; this.texts = []; this.width = 600;
-    this.layout = shared("herdr-git:layout") ?? "auto"; this.wrap = shared("herdr-git:wrap") ?? true;
-    this.ws = shared("herdr-git:ws") ?? false; this.context = shared("herdr-git:context") ?? 3; this.full = shared("herdr-git:full") ?? false; this.sub = shared("herdr-git:sub") ?? "log";
+    this.layout = shared("smart-git:layout") ?? "auto"; this.wrap = shared("smart-git:wrap") ?? true;
+    this.ws = shared("smart-git:ws") ?? false; this.context = shared("smart-git:context") ?? 3; this.full = shared("smart-git:full") ?? false; this.sub = shared("smart-git:sub") ?? "log";
     this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = [];
     this.handle = cx.focus_handle();
     this.scroll = VirtualListScrollHandle.new();
@@ -77,14 +78,16 @@ export class Diff {
 
   // What the sidebar selected; reloads when it (or how it's shown) changes. Render calls this.
   sync(cx) {
-    const s = shared("herdr-git:show");
+    const s = shared("smart-git:show");
     const key = JSON.stringify([s, this.ws, this.context, this.sub, this.full]);
     if (!s || key === this.loaded) return;
     // The same thing again (changed on disk, or a line staged): keep the place.
     const same = s.kind === this.shown?.kind && s.title === this.shown?.title;
     if (!same) this.open = new Set();
-    this.loaded = key; this.shown = s; this.title = s.title; this.error = null;
+    // An action's failure survives the reload it triggers; any other reload clears the old message.
+    this.loaded = key; this.shown = s; this.title = s.title; this.error = this.failed ?? null; this.failed = null; this.pending = true;
     cx.spawn(async (cx) => {
+      const tLoad = Date.now(); // PERF
       const rows = [], texts = [], files = new Map();
       let conflict = null, truncated = 0;
       // A file's lines on the new side of a section, for the gaps that were opened.
@@ -103,8 +106,10 @@ export class Diff {
           rows.push(...conflictRows(conflict));
         } else for (const [label, args] of sources(s, this)) {
           const text = await git(s.repo, args);
+          // A newer selection came while git ran: leave its rows unparsed.
+          if (this.loaded !== key) return;
           if (label && !text.trim()) continue;
-          if (label) rows.push({ kind: "s", text: label });
+          if (label && label !== texts[texts.length - 1]?.label) rows.push({ kind: "s", text: label });
           const src = texts.push({ label, text }) - 1;
           if (LOGS.includes(s.kind)) { rows.push(...logRows(text)); continue; }
           const d = diffRows(text);
@@ -122,7 +127,7 @@ export class Diff {
         }
       } catch (e) { if (this.loaded === key) this.error = String(e.message ?? e); }
       if (this.loaded !== key) return;
-      this.truncated = truncated;
+      this.truncated = truncated; this.pending = false;
       // Rows added above (a gap opened) keep the cursor on its line while the section is the same.
       const at = this.rows[this.cur];
       if (same && at?.raw !== undefined && texts[at.src]?.text === this.texts[at.src]?.text) {
@@ -145,6 +150,7 @@ export class Diff {
         this.cur = n >= 0 ? n : last;
         this.anchor = null;
       }
+      perf(`diff load ${s.kind}`, tLoad); // PERF
       cx.notify();
     });
   }
@@ -192,8 +198,8 @@ export class Diff {
     this.busy = true; this.error = null; cx.notify();
     cx.spawn(async (cx) => {
       try { await work(cx); }
-      catch (e) { this.error = String(e.message ?? e); }
-      finally { this.busy = false; this.loaded = null; setShared("herdr-git:bump", Date.now()); cx.notify(); }
+      catch (e) { this.error = this.failed = String(e.message ?? e); }
+      finally { this.busy = false; this.loaded = null; setShared("smart-git:bump", Date.now()); cx.notify(); }
     });
   }
 
@@ -208,7 +214,7 @@ export class Diff {
   }
 
   async apply(repo, text, args) {
-    const file = `${(await git(repo, ["rev-parse", "--absolute-git-dir"])).trim()}/herdr-git.patch`;
+    const file = `${(await git(repo, ["rev-parse", "--absolute-git-dir"])).trim()}/smart-git.patch`;
     const w = await writeThere(repo, file, text);
     if (w.code !== 0) throw new Error(w.stderr.trim());
     await git(repo, ["apply", "--recount", ...args, file], { write: true });
@@ -222,7 +228,7 @@ export class Diff {
       if (!staged && s.untracked) {
         // Git can only take part of a file it knows: mark it intended, then lines can be picked.
         await git(s.repo, ["add", "--intent-to-add", "--", s.path], { write: true });
-        this.error = "The file is tracked now: pick its lines again";
+        this.failed = "The file is tracked now: pick its lines again";
         return;
       }
       const p = this.patch(staged);
@@ -311,7 +317,7 @@ export class Diff {
       g: () => { this.cur = -1; this.step(1); }, G: () => { this.cur = this.rows.length; this.step(-1); },
       v: () => { this.anchor = this.anchor === null ? this.cur : null; this.hunk = false; },
       a: () => { this.hunk = !this.hunk; this.anchor = null; },
-      ...(s.kind === "file" ? { space: () => this.stageLines(cx), d: () => this.discardLines(cx), e: () => run("herdr-git.edit") } : {}),
+      ...(s.kind === "file" ? { space: () => this.stageLines(cx), d: () => this.discardLines(cx), e: () => this.editAt(cx) } : {}),
       ...(s.kind === "commit" ? { space: () => this.commitPatch(cx), "ctrl-p": () => this.commitPatch(cx) } : {}),
       // Lazygit's hunk keys; files have none there, so J/K (its keys to scroll this panel).
       h: () => this.jump("@", -1), left: () => this.jump("@", -1), l: () => this.jump("@", 1), right: () => this.jump("@", 1),
@@ -319,20 +325,22 @@ export class Diff {
     };
     const common = {
       s: () => this.setLayout({ auto: "split", split: "unified", unified: "auto" }[this.layout]), w: () => this.toggle("wrap"), "ctrl-w": () => this.toggle("ws"), f: () => this.toggle("full"),
-      S: () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("herdr-git:sub", this.sub); },
-      "{": () => { this.context = Math.max(0, this.context - 1); setShared("herdr-git:context", this.context); },
-      "}": () => { this.context++; setShared("herdr-git:context", this.context); },
+      S: () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("smart-git:sub", this.sub); },
+      "{": () => { this.context = Math.max(0, this.context - 1); setShared("smart-git:context", this.context); },
+      "}": () => { this.context++; setShared("smart-git:context", this.context); },
       z: () => this.zoom(),
       // Side by side, unwrapped: both halves sideways, as lazygit's H/L.
       H: () => { this.dx -= 8 * CHAR; }, L: () => { this.dx += 8 * CHAR; },
       escape: () => { if (this.anchor !== null || this.hunk) { this.anchor = null; this.hunk = false; } else this.back(); },
       q: () => this.back(),
+      // 1–5 jump to that sidebar section, as from the sidebar; the diff stays zoomed.
+      ...Object.fromEntries([1, 2, 3, 4, 5].map((n) => [String(n), () => run(`smart-git.sidebar:${n}`)])),
       // The sidebar's ? lists every key; here, the diff's. Picking one runs it.
       "?": () => cx.spawn(async (cx) => {
         const keys = [["j", "Next line"], ["k", "Previous line"], ["g", "First line"], ["G", "Last line"], ["v", "Select lines"], ["a", "Hunk mode"],
           ["space", "Stage lines (file)"], ["d", "Discard lines (file)"], ["e", "Edit file (file)"], ["h", "Previous hunk"], ["l", "Next hunk"],
           ["K", "Previous file"], ["J", "Next file"], ["s", "Change layout"], ["w", "Wrap lines"], ["ctrl-w", "Ignore whitespace"], ["f", "Whole file"],
-          ["S", "Toggle submodule diff"], ["{", "Less context"], ["}", "More context"], ["z", "Zoom"], ["H", "Scroll left"], ["L", "Scroll right"], ["q", "Back"]];
+          ["S", "Toggle submodule diff"], ["{", "Less context"], ["}", "More context"], ["z", "Zoom"], ["H", "Scroll left"], ["L", "Scroll right"], ["q", "Back"], ["1", "Sidebar: Status"], ["2", "Sidebar: Files"], ["3", "Sidebar: Branches"], ["4", "Sidebar: Commits"], ["5", "Sidebar: Stash"]];
         const k = await ask({ title: "Keys", items: keys.map(([value, label]) => ({ key: "", label: `${value}  ${label}`, value })) });
         if (k) { this.key(k, cx); cx.notify(); }
       }),
@@ -344,18 +352,29 @@ export class Diff {
     return true;
   }
 
-  pane() { return panes().find((p) => p.pane === focused()?.pane && p.mod === "herdr-git") ?? panes().find((p) => p.tab === focused()?.tab && p.mod === "herdr-git"); }
+  pane() { return panes().find((p) => p.pane === focused()?.pane && p.mod === "smart-git") ?? panes().find((p) => p.tab === focused()?.tab && p.mod === "smart-git"); }
+  // e: the shown file in the editor, at the selected line (a removed line has no number in
+  // the file: the next line that does). Opened from here: the sidebar may be hidden in its stack.
+  editAt(cx) {
+    const s = this.shown, n = this.rows.slice(Math.max(0, this.cur)).find((r) => r.new != null)?.new;
+    if (s.title.endsWith("/")) { this.error = "A folder: pick one of its files to edit it"; return cx.notify(); }
+    cx.spawn(async (cx) => {
+      try { await openEditor(s.repo, s.path, this.cur >= 0 && n ? n : null, cx); }
+      catch (e) { this.error = String(e.message ?? e); cx.notify(); }
+    });
+  }
   zoom() { const p = this.pane(); if (p) run("pane.zoom", { pane: p.pane }); }
   // Back to the sidebar, and the layout back as it was.
-  back() { if (this.pane()?.zoomed) this.zoom(); run("pane.go", { direction: "right" }); }
+  // The sidebar focuses itself: pane.go from the (zoomed) diff didn't reach it.
+  back() { if (this.pane()?.zoomed) this.zoom(); run("smart-git.sidebar"); }
 
   isLog() { return LOGS.includes(this.shown?.kind); }
   wrapped() { return this.wrap; }
   // "split", "unified", or "auto": side by side once the pane is as wide as VS Code's breakpoint.
   sideBySide() { return !this.conflict && !this.isLog() && (this.layout === "split" || (this.layout === "auto" && this.width >= 900)); }
-  setLayout(layout) { this.layout = layout; setShared("herdr-git:layout", layout); this.vis = null; }
+  setLayout(layout) { this.layout = layout; setShared("smart-git:layout", layout); this.vis = null; }
 
-  toggle(what) { this[what] = !this[what]; setShared(`herdr-git:${what}`, this[what]); this.vis = null; }
+  toggle(what) { this[what] = !this[what]; setShared(`smart-git:${what}`, this[what]); this.vis = null; }
 
   // The rows as drawn: wrapped to the pane's width (each piece its own row, so every row
   // keeps the list's one height), or as they are, for scrolling sideways.
@@ -407,7 +426,8 @@ export class Diff {
     return "s layout · f full file · w wrap · z zoom · {/} context · esc back";
   }
 
-  render(cx) {
+  render(cx) { const t0 = Date.now(), r = this.render2(cx); perf(`diff render (${this.rows.length} rows)`, t0); return r; } // PERF
+  render2(cx) { // PERF
     this.sync(cx);
     const t = theme(), mono = settings().font_family ?? "JetBrains Mono", focused = this.handle.is_focused();
     const split = this.sideBySide();
@@ -504,8 +524,8 @@ export class Diff {
     // A toggle: its icon is what it does, lit while it's on.
     const button = (id, name, active, tip, on) => div().id(id).tooltip(tip).size(24).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
       .text_color(active ? t.foreground : t.dim).when(active, (e) => e.bg(t.selection)).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { on(); cx.notify(); }).child(svg(`mods/herdr-git/${name}.svg`).size(14));
-    return v_flex().id("herdr-git-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12)
+      .on_click((_e, cx) => { on(); cx.notify(); }).child(svg(`mods/smart-git/${name}.svg`).size(14));
+    return v_flex().id("smart-git-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12)
       .track_focus(this.handle).on_key_down((e, cx) => { if (this.key(keyOf(e), cx)) cx.stop_propagation(); })
       // Sizes come back zoomed; lengths given to elements get zoomed again, so measure unzoomed.
       .on_mouse_move((e, cx) => { if (this.drag) { this.dx = this.drag.dx + (e.position.x - this.drag.x) / zoom * this.drag.k; cx.notify(); } })
@@ -524,13 +544,15 @@ export class Diff {
           .child(button("split", "columns-2", this.layout === "split", "Side by side: old left, new right (s)", () => this.setLayout("split")))
           .child(button("auto", "move-horizontal", this.layout === "auto", "Auto: side by side when the pane is wide enough (s)", () => this.setLayout("auto")))))
       .when(Boolean(this.error), (e) => e.child(div().id("error").p(10).text_color(t.ansi1).cursor_pointer().on_click((_e, cx) => { this.error = null; cx.notify(); }).child(this.error)))
+      .when(!this.pending && !this.error && !this.conflict && !this.rows.length && Boolean(this.shown), (e) => e.child(div().p(10).text_color(t.muted)
+        .child(this.ws ? "Nothing to show: only whitespace changed (ctrl-w shows it)" : "Nothing to show here")))
       .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child("No conflict markers left. M in the files list keeps one side of the whole file.")))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
-        .child(div().id("herdr-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
+        .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))
           // Where a press lands says which side of a row was clicked: the list only names the row.
           .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); })
-            .child(v_virtual_list("herdr-git-rows", rows.length, ROW, (i) => String(i),
+            .child(v_virtual_list("smart-git-rows", rows.length, ROW, (i) => String(i),
             (range) => rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k))).track_scroll(this.scroll).size_full()
             .on_item_click((key, cx) => {
               const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
@@ -541,7 +563,7 @@ export class Diff {
               if (r?.side) { this.ci = r.c; this.side = r.side; }
               cx.notify();
             }))))
-        .child(Scrollbar.vertical("herdr-git-rows").viewport_from_layout().absolute().inset_0())
+        .child(Scrollbar.vertical("smart-git-rows").viewport_from_layout().absolute().inset_0())
         .when(sideways && maxDx > 0, (e) => e.child(bar(0)).child(bar(half + 1))))
       .child(div().flex_none().px(12).py(5).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim).truncate()
         .child(this.busy ? "Working…" : (this.anchor !== null ? "range · " : this.hunk ? "hunk · " : "") + (sideways ? "H/L scroll · " : "") + this.hints()));

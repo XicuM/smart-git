@@ -8,6 +8,8 @@ import { props, theme, settings, openOverlay, closeOverlay } from "herdr";
 const NAMED = ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "space"];
 export function keyOf(e) {
   const m = e.modifiers ?? {};
+  // AltGr can come as alt: on a Spanish keyboard AltGr+` types "[", which is that key, not alt-`.
+  if (m.alt && !m.control && !m.platform && e.key_char && e.key_char !== e.key) return e.key_char;
   if (m.control || m.alt || m.platform) return e.keystroke;
   if (NAMED.includes(e.key)) return (m.shift ? "shift-" : "") + e.key;
   return e.key_char ?? e.key;
@@ -18,15 +20,16 @@ const replies = new Map();
 let asked = 0;
 export function ask(spec) {
   const id = `ask-${++asked}`;
-  // A menu ({ menu: true, items }) opens at the pointer, sized to its rows.
+  // A menu ({ menu: true, items }) opens at the pointer, sized to its rows; { sep: true } is a line between groups.
   const size = spec.menu
-    ? { kind: "popup", width: 300, height: Math.min(640, 14 + (spec.title ? 26 : 0) + spec.items.length * 30) }
+    ? { kind: "popup", width: 300, height: Math.min(640, 14 + (spec.title ? 26 : 0) + spec.items.reduce((h, i) => h + (i.sep ? SEP : 30), 0)) }
     : { kind: "dialog", width: 460 };
   return new Promise((resolve) => {
     replies.set(id, resolve);
-    openOverlay({ mod: "herdr-git", ...size, props: { view: "ask", id, ...spec } });
+    openOverlay({ mod: "smart-git", ...size, props: { view: "ask", id, ...spec } });
   });
 }
+const SEP = 9;
 const reply = (id, value) => { replies.get(id)?.(value); replies.delete(id); };
 // `hint` explains what the action does (shown under it), for the ones that change history.
 export const confirm = (title, detail, label, danger = true, hint) => ask({ title, detail, items: [{ key: "enter", label, value: true, danger, hint }] });
@@ -36,6 +39,8 @@ export const confirm = (title, detail, label, danger = true, hint) => ask({ titl
 export class Ask {
   constructor(cx) {
     const p = props();
+    // Kept here: props() may be gone by the time close() runs, and then the asker would wait forever.
+    this.id = p.id; this.overlay = p.overlay;
     this.handle = cx.focus_handle(); this.sel = 0;
     if (p.input) {
       this.input = InputState.new({ value: p.input.value ?? "", placeholder: p.input.placeholder ?? "" });
@@ -46,8 +51,8 @@ export class Ask {
     } else { this.handle.focus(); cx.timer.after(150, () => this.handle.focus()); }
   }
 
-  done(value) { const p = props(); reply(p.id, value); closeOverlay(p.overlay); }
-  close() { reply(props()?.id, null); }
+  done(value) { reply(this.id, value); closeOverlay(this.overlay); }
+  close() { reply(this.id, null); }
 
   key(e, cx) {
     const p = props(), items = p.items ?? [], k = keyOf(e);
@@ -60,8 +65,10 @@ export class Ask {
     }
     const hit = items.find((i) => i.key === k && k !== "enter");
     if (hit) return this.done(hit.value);
-    if (k === "j" || k === "down") this.sel = Math.min(this.sel + 1, items.length - 1);
-    else if (k === "k" || k === "up") this.sel = Math.max(this.sel - 1, 0);
+    // Moving skips the separators.
+    const step = (d) => { let n = this.sel + d; while (items[n]?.sep) n += d; if (items[n]) this.sel = n; };
+    if (k === "j" || k === "down") step(1);
+    else if (k === "k" || k === "up") step(-1);
     else if (k === "enter" || k === "space") return this.done(items[this.sel]?.value ?? null);
     else return;
     cx.stop_propagation(); cx.notify();
@@ -71,19 +78,20 @@ export class Ask {
     const t = theme(), p = props() ?? {}, items = p.items ?? [];
     // What the selected item does, when it says (destructive git commands do).
     const hint = items[this.sel]?.hint;
+    const sep = (n) => div().id(`item-${n}`).h(SEP).flex_none().px(8).flex().items_center().child(div().h(1).w_full().bg(t.border));
     const explain = () => div().when(Boolean(hint), (e) => e.mt(6).px(8).py(6).border_t(1).border_color(t.border).text_size(11.5).text_color(items[this.sel]?.danger ? t.ansi1 : t.muted).child(hint ?? ""));
     // A right-click menu: compact rows like Herdr's own menu, each with its key on the right.
-    if (p.menu) return v_flex().id("herdr-git-menu").w_full().max_h(640).p(5).bg(t.popover).text_color(t.foreground).text_size(12.8)
+    if (p.menu) return v_flex().id("smart-git-menu").w_full().max_h(640).p(5).bg(t.popover).text_color(t.foreground).text_size(12.8)
       .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .when(Boolean(p.title), (e) => e.child(div().h(26).flex_none().px(8).flex().items_center().text_size(11.5).text_color(t.dim).truncate().child(p.title)))
-      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(30).flex_none().px(8).gap(9).items_center().rounded(7).cursor_pointer()
+      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => item.sep ? sep(n) : h_flex().id(`item-${n}`).h(30).flex_none().px(8).gap(9).items_center().rounded(7).cursor_pointer()
         .when(n === this.sel, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
         .on_click(() => this.done(item.value))
         .when(Boolean(item.hint), (e) => e.tooltip(item.hint))
         .child(div().flex_1().min_w(0).truncate().text_color(item.danger ? t.ansi1 : t.foreground).child(item.label))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(item.key)))))
       .child(explain());
-    return v_flex().id("herdr-git-ask").w_full().max_h(620).p(p.menu ? 6 : 16).gap(p.menu ? 0 : 10).bg(t.popover).text_color(t.foreground).text_size(13)
+    return v_flex().id("smart-git-ask").w_full().max_h(620).p(p.menu ? 6 : 16).gap(p.menu ? 0 : 10).bg(t.popover).text_color(t.foreground).text_size(13)
       .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .when(Boolean(p.title), (e) => e.child(div().font_semibold().when(Boolean(p.menu), (e) => e.px(8).h(26).text_size(12).text_color(t.muted).flex().items_center()).child(p.title)))
       .when(Boolean(p.detail), (e) => e.child(div().text_size(12).text_color(t.muted).child(p.detail)))
@@ -91,7 +99,7 @@ export class Ask {
         .child(Input.new(this.input).h_full().text_size(13))))
       .when(Boolean(this.desc), (e) => e.child(div().h(120).rounded(7).border_1().border_color(t.input).overflow_hidden().child(Editor.new(this.desc).size_full()))
         .child(div().text_size(11).text_color(t.dim).child(p.descriptionHint ?? "enter commit · tab description · ctrl-enter commit from description · esc cancel")))
-      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => h_flex().id(`item-${n}`).h(28).flex_none().px(8).gap(10).items_center().rounded(6).cursor_pointer()
+      .child(v_flex().id("items").flex_shrink_1().min_h(0).overflow_y_scroll().children(items.map((item, n) => item.sep ? sep(n) : h_flex().id(`item-${n}`).h(28).flex_none().px(8).gap(10).items_center().rounded(6).cursor_pointer()
         .when(n === this.sel, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
         .on_click(() => this.done(item.value))
         .child(div().min_w(18).flex_none().text_color(t.accent).text_size(12).child(item.key === "enter" ? "⏎" : item.key))
