@@ -64,7 +64,6 @@ const EXPLAIN = {
     space: "Moves HEAD to this commit without a branch (detached). Commits you make there are lost unless you create a branch.",
     g: "Moves the branch back to this commit. Commits after it leave the branch (the reflog keeps them); soft, mixed or hard says what happens to their changes.",
     r: `Changes this commit's message only. ${REWRITE}`,
-    R: `Changes this commit's message in your editor. ${REWRITE}`,
     s: `Melds this commit into the older one below it, keeping both messages. ${REWRITE}`,
     f: `Melds this commit into the older one below it and discards this commit's message. ${REWRITE}`,
     d: `Removes this commit and its changes from the branch; the commits after it are replayed without it and may conflict. ${REWRITE}`,
@@ -478,7 +477,7 @@ class Sidebar {
 
   edit(path, cx, line) { return openEditor(this.repo, path, line, cx); }
 
-  // E: which editor e, C and R open; only the ones installed are offered.
+  // E: which editor e opens; only the ones installed are offered.
   async pickEditor() {
     const r = await exec("sh", ["-c", "for e in micro nano nvim vim vi hx emacs; do command -v $e >/dev/null && echo $e; done"], { on: this.repo.on });
     const cur = shared("smart-git:editor");
@@ -851,7 +850,6 @@ class Sidebar {
         c: ["Write commit message", () => this.subject.focus()],
         I: ["Write it with AI", () => act("Writing message…", (cx) => this.generate(cx))],
         w: ["Commit without hooks", () => act("Committing…", () => this.commit({ noVerify: true }))],
-        C: ["Commit in your editor", () => this.inTerminal(["git", "commit"])],
         "|2": null,
         d: [row?.file?.sub ? "Reset submodule" : "Discard…", () => row && act("Discarding…", async () => {
           if (row.file?.sub) return this.resetSub(row.file.path);
@@ -1141,9 +1139,6 @@ class Sidebar {
           if (w.code !== 0) throw new Error(w.stderr.trim());
           await this.rewrite(row.id, (t) => t.splice(1, 0, { action: "exec", rest: `git commit --amend --only --no-verify -F '${file.replace(/'/g, "'\\''")}'` }));
         })],
-        R: ["Reword in your editor", () => row && this.inTerminal(row.id === this.head.oid
-          ? ["git", "commit", "--amend", "--only"]
-          : ["git", "rebase", "-i", "--autostash", `${row.id}^`])],
         s: ["Squash into the one below", () => row?.commit && act("Squashing…", async () => {
           if (await confirm(`Squash ${short} into the commit below?`, row.commit.subject, "Squash", true, EXPLAIN.commits.s)) await this.rewrite(`${row.id}^`, (t) => { Sidebar.at(t, row.id).action = "squash"; });
         })],
