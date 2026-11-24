@@ -995,12 +995,16 @@ class Sidebar {
     if (row.file || row.dir) {
       const f = row.file, files = row.file ? [row.file] : row.files;
       const staged = files.every((x) => x.staged && !x.unstaged), some = files.some((x) => x.staged);
-      const label = name(row.dir ? row.name + "/" : row.name, f ? (f.conflict ? t.ansi1 : staged ? t.ansi2 : f.untracked ? t.ansi1 : t.foreground) : t.muted);
+      // A folder shows what space would do to it: green all staged, amber some, plain none.
+      const label = name(row.dir ? row.name + "/" : row.name, f ? (f.conflict ? t.ansi1 : staged ? t.ansi2 : f.untracked ? t.ansi1 : t.foreground) : staged ? t.ansi2 : some ? t.blocked : t.muted);
       const xy = f ? h_flex().flex_none().w(18).text_size(11).child(div().text_color(t.ansi2).child(f.x === "." ? " " : f.x === "?" ? "?" : f.x)).child(div().text_color(t.ansi1).child(f.y === "." ? " " : f.y))
         : h_flex().flex_none().w(18).text_color(staged ? t.ansi2 : some ? t.blocked : t.dim).child(icon(this.collapsed.has(row.dir) ? "chevron-right" : "chevron-down").size(12));
       // A submodule says what changed in it: its commit, its files, or new files.
       const sub = f?.sub ? [f.sub[1] === "C" && "commit", f.sub[2] === "M" && "modified", f.sub[3] === "U" && "untracked"].filter(Boolean).join(", ") : "";
-      return base.pl(8 + row.depth * 12).child(xy).child(label).when(Boolean(f?.sub), (e) => e.child(dim(`submodule${sub ? ": " + sub : ""}`)));
+      const done = row.dir ? files.filter((x) => x.staged && !x.unstaged).length : 0;
+      return base.pl(8 + row.depth * 12).child(xy).child(label)
+        .when(Boolean(row.dir) && done > 0 && !staged, (e) => e.child(dim(`${done}/${files.length} staged`)))
+        .when(Boolean(f?.sub), (e) => e.child(dim(`submodule${sub ? ": " + sub : ""}`)));
     }
     if (row.branch) {
       const b = row.branch;
