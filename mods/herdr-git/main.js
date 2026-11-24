@@ -1,7 +1,7 @@
 // herdr-git: lazygit's side panels as a herdr sidebar. The same mod draws the diff pane
 // (props.view "diff") and its own dialogs (props.view "ask").
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, ScrollHandle, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input } from "gpui-base";
 import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, checking } from "herdr";
 import {
   location, git, findRoot, writeThere, rebaseWith, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
@@ -11,6 +11,7 @@ import { Diff } from "./diff.js";
 import { ask, confirm, keyOf, Ask } from "./ask.js";
 
 const ROW = 26, HEAD = 30;
+const seen = new Map();
 const icon = (name) => svg(`mods/workspace-chrome/${name}.svg`);
 // Status is the title bar; the rest are the sidebar's sections, each with lazygit's tabs.
 const PANELS = [
@@ -82,7 +83,7 @@ export default class HerdrGit extends View {
 class Sidebar {
   constructor(cx) {
     this.handle = cx.focus_handle();
-    this.scrolls = Object.fromEntries(PANELS.map((p) => [p.id, ScrollHandle.new()]));
+    this.scrolls = Object.fromEntries(PANELS.map((p) => [p.id, VirtualListScrollHandle.new()]));
     this.folded = new Set(shared("herdr-git:folded") ?? []);
     this.tabs = { status: "status", files: "files", branches: "branches", commits: "commits", stash: "stash", ...(shared("herdr-git:tabs") ?? {}) };
     this.stack = []; this.panel = "files"; this.collapsed = new Set(); this.copied = [];
@@ -93,12 +94,13 @@ class Sidebar {
     this.filter.on("submit", (_e, cx) => { this.filtering = false; this.handle.focus(); cx.notify(); });
     this.filterText = "";
     this.bump = shared("herdr-git:bump");
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    // The folder watch keeps a local repo current; the timer is for remote ones (and a watch that failed).
+    cx.timer.every(10000, (cx) => { if (!this.watching) this.refresh(cx); });
   }
 
   clear() {
     this.head = {}; this.files = []; this.branches = []; this.commits = []; this.stash = []; this.submodules = []; this.worktrees = [];
-    this.remotes = []; this.remoteBranches = []; this.tags = []; this.reflog = []; this.ops = []; this.todo = []; this.gitDir = "";
+    this.remotes = []; this.remoteBranches = []; this.tags = []; this.reflog = []; this.ops = []; this.todo = []; this.gitDir = ""; this.raw = null;
     this.sel = {}; this.inRemote = null; this.diffBase = null; this.pathFilter = null; this.info = null;
   }
 
@@ -128,10 +130,16 @@ class Sidebar {
     });
   }
 
+  // Each repo keeps what it showed, so coming back to it (another space or tab) is instant
+  // and the refresh only updates it.
   go(stack, cx) {
+    const key = (st) => JSON.stringify(st), keep = ["head", "files", "branches", "commits", "stash", "submodules", "worktrees", "remotes", "remoteBranches", "tags", "reflog", "ops", "todo", "gitDir", "sel", "inRemote", "stamp", "raw"];
+    if (this.stack.length) seen.set(key(this.stack), Object.fromEntries(keep.map((k) => [k, this[k]])));
     this.stack = stack;
     this.error = stack.length ? null : "Not a git repository";
-    this.clear(); this.refresh(cx); this.watch(cx); cx.notify();
+    const old = seen.get(key(stack));
+    if (old) Object.assign(this, old, { diffBase: null, pathFilter: null, info: null }); else this.clear();
+    this.refresh(cx); this.watch(cx); this.show(cx); cx.notify();
   }
 
   watch(cx) {
@@ -145,6 +153,9 @@ class Sidebar {
         while (this.watching === repo.root) {
           this.watchCall = watchFolder(repo.root);
           const changed = await this.watchCall;
+          // A save or an agent's edit comes as a burst of changes: refresh once it settles. The refresh
+          // reads git after the wait, so changes during it are in it.
+          if (changed.length) await cx.sleep(300);
           if (this.watching === repo.root && changed.length) this.refresh(cx);
         }
       } catch { if (this.watching === repo.root) this.watching = null; }
@@ -157,6 +168,9 @@ class Sidebar {
     if (this.loading) { this.again = true; return; }
     this.loading = true; this.again = false;
     const soft = (p) => p.catch(() => "");
+    // Submodules cost a git run in each of them (half a second in a repo of 65): only while their tab shows.
+    const subsShown = this.tabs.files === "submodules";
+    let same = false;
     cx.spawn(async (cx) => {
       try {
         const [status, branches, log, stash, subs, subConfig, worktrees, remotes, remoteBranches, tags, reflog, state] = await Promise.all([
@@ -164,8 +178,8 @@ class Sidebar {
           git(repo, ["for-each-ref", "--sort=-committerdate", `--format=${BRANCH_FORMAT}`, "refs/heads"]),
           soft(git(repo, ["log", `--format=${LOG_FORMAT}`, "-n", "300", "HEAD", "--", ...(this.pathFilter ? [this.pathFilter] : [])])),
           git(repo, ["stash", "list", "--format=%gd%x1f%cr%x1f%gs"]),
-          soft(git(repo, ["submodule", "status", "--recursive"])),
-          soft(git(repo, ["config", "-z", "--file", ".gitmodules", "--get-regexp", "^submodule\\."])),
+          subsShown ? soft(git(repo, ["submodule", "status", "--recursive"])) : null,
+          subsShown ? soft(git(repo, ["config", "-z", "--file", ".gitmodules", "--get-regexp", "^submodule\\."])) : null,
           soft(git(repo, ["worktree", "list", "--porcelain"])),
           git(repo, ["remote", "-v"]),
           git(repo, ["for-each-ref", "--sort=-committerdate", `--format=${REF_FORMAT}`, "refs/remotes"]),
@@ -174,9 +188,13 @@ class Sidebar {
           exec("sh", ["-c", STATE], { cwd: repo.root, on: repo.on }).then((r) => r.stdout),
         ]);
         if (repo !== this.repo) return;
+        // Nothing changed (the timer, or a change git doesn't show): no redraw.
+        const raw = [status, branches, log, stash, subs, subConfig, worktrees, remotes, remoteBranches, tags, reflog, state].join("\0\x1e");
+        if (raw === this.raw && !this.error) { same = true; return; }
+        this.raw = raw;
         const s = parseStatus(status);
         this.head = s.head; this.files = s.files; this.branches = parseBranches(branches);
-        this.commits = parseLog(log); this.stash = parseStash(stash); this.submodules = parseSubmodules(subs, subConfig);
+        this.commits = parseLog(log); this.stash = parseStash(stash); if (subs !== null) this.submodules = parseSubmodules(subs, subConfig);
         this.worktrees = parseWorktrees(worktrees); this.remotes = parseRemotes(remotes); this.remoteBranches = parseRefs(remoteBranches);
         this.tags = parseRefs(tags); this.reflog = parseReflog(reflog);
         const [dir, ...rest] = state.split("\n"), t = rest.indexOf("--todo");
@@ -188,7 +206,7 @@ class Sidebar {
         for (let i = 0; i < status.length; i++) h = (h * 31 + status.charCodeAt(i)) | 0;
         this.stamp = h; this.error = null;
       } catch (e) { if (repo === this.repo) this.error = String(e.message ?? e); }
-      finally { this.loading = false; if (this.again) this.refresh(cx); this.show(cx); cx.notify(); }
+      finally { this.loading = false; if (this.again) this.refresh(cx); if (!same) { this.show(cx); cx.notify(); } }
     });
   }
 
@@ -208,7 +226,7 @@ class Sidebar {
     if (view === "commits") {
       // A rebase's todo comes first, the last to be applied on top, as lazygit shows it.
       const todo = this.todo.map((t, n) => ({ id: `todo-${n}`, todo: t, n, text: t.rest })).reverse();
-      return [...todo, ...this.commits.map((c) => ({ id: c.hash, commit: c, text: `${c.short} ${c.subject}` }))].filter(keep);
+      return [...todo, ...this.commits.map((c, n) => ({ id: c.hash, commit: c, ahead: n < this.head.ahead, text: `${c.short} ${c.subject}` }))].filter(keep);
     }
     // Built once per change of what it's made of, not on every key and draw.
     const made = [this.files, q, this.tree, [...this.collapsed].join("\0")];
@@ -313,6 +331,7 @@ class Sidebar {
   setTab(panel, tab, cx) {
     if (tab !== "remotes") this.inRemote = null;
     this.tabs[panel] = tab; setShared("herdr-git:tabs", this.tabs);
+    if (tab === "submodules") this.refresh(cx);
     this.select(panel, this.sel[this.viewOf(panel)] ?? 0, cx);
   }
 
@@ -988,8 +1007,8 @@ class Sidebar {
   }
 
   // --- Drawing ---
-  line(row, selected, t) {
-    const base = h_flex().h(ROW).flex_none().px(8).gap(8).items_center().rounded(7).when(selected, (e) => e.bg(this.handle.is_focused() ? t.selected : t.hover));
+  line(row, selected, t, focused) {
+    const base = h_flex().h(ROW).flex_none().px(8).gap(8).items_center().rounded(7).when(selected, (e) => e.bg(focused ? t.selected : t.hover));
     const dim = (s) => div().text_color(t.dim).flex_none().child(s);
     const name = (s, color = t.foreground) => div().flex_1().min_w(0).truncate().text_color(color).child(s);
     if (row.file || row.dir) {
@@ -1015,7 +1034,7 @@ class Sidebar {
     }
     if (row.commit) {
       const c = row.commit, copied = this.copied.some((x) => x.hash === c.hash);
-      return base.child(div().flex_none().text_color(copied ? t.accent : this.commits.indexOf(c) < this.head.ahead ? t.ansi1 : t.ansi3).child(c.short))
+      return base.child(div().flex_none().text_color(copied ? t.accent : row.ahead ? t.ansi1 : t.ansi3).child(c.short))
         .when(copied, (e) => e.child(div().flex_none().text_color(t.accent).child("◆")))
         .child(name(c.subject))
         .when(Boolean(c.refs), (e) => e.child(div().flex_none().max_w(110).truncate().text_size(11).text_color(t.accent).child(c.refs.replace("HEAD -> ", ""))));
@@ -1109,17 +1128,27 @@ class Sidebar {
       if (!rows.length) return el.flex_none().when(filter > 0, (e) => e.child(filterBox)).child(div().px(14).pb(8).text_size(12).text_color(t.dim).child(this.empty(view)));
       return el.flex_1().min_h(HEAD + Math.min(rows.length, 3) * ROW + 8 + filter).max_h(HEAD + rows.length * ROW + 8 + filter)
         .when(filter > 0, (e) => e.child(filterBox))
-        // A plain scroll area placed absolutely, as the shipped Changes list does: its size comes from the section.
+        // A virtual list placed absolutely, its size from the section: only the rows on screen are built.
+        // The list reports a click's row, not its click count: the press before it says (`clicks`).
         .child(div().flex_1().min_h(0).relative()
-          .child(v_flex().id(`list-${p.id}`).absolute().inset_0().px(6).pb(6).overflow_y_scroll().track_scroll(this.scrolls[p.id]).children(rows.slice(0, 2000).map((row, j) =>
-            div().id(`row-${row.id}`).flex_none().cursor_pointer().on_click((e, cx) => {
-              this.handle.focus(); this.select(p.id, j, cx);
-              // A folder opens or closes on one click (a double click's second click does nothing more).
-              if (row.dir) { if (e.click_count === 1) this.key("enter", cx); }
-              else if (e.click_count === 2) this.key(["files", "branches", "worktrees"].includes(view) ? "space" : "enter", cx);
-            }).on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.handle.focus(); this.select(p.id, j, cx); this.menu(cx); })
-              .child(this.line(row, active && j === sel, t)))))
-          .child(Scrollbar.vertical(`list-${p.id}`).absolute().inset_0()));
+          .child(div().absolute().inset_0().px(6).pb(6).on_mouse_down("left", (e) => { this.clicks = e.click_count; })
+            .child(v_virtual_list(`list-${p.id}`, rows.length, ROW, (j) => rows[j].id,
+              (range) => rows.slice(range.start, range.end).map((row, k) => this.line(row, active && range.start + k === sel, t, focused).cursor_pointer()))
+              .track_scroll(this.scrolls[p.id]).size_full()
+              .on_item_click((key, cx) => {
+                const j = rows.findIndex((r) => r.id === key), row = rows[j];
+                if (!row) return;
+                this.handle.focus(); this.select(p.id, j, cx);
+                // A folder opens or closes on one click (a double click's second click does nothing more).
+                if (row.dir) { if (this.clicks === 1) this.key("enter", cx); }
+                else if (this.clicks === 2) this.key(["files", "branches", "worktrees"].includes(view) ? "space" : "enter", cx);
+              })
+              .on_item_secondary_click((key, _e, cx) => {
+                const j = rows.findIndex((r) => r.id === key);
+                if (j < 0) return;
+                cx.stop_propagation(); this.handle.focus(); this.select(p.id, j, cx); this.menu(cx);
+              })))
+          .child(Scrollbar.vertical(`list-${p.id}`).viewport_from_layout().absolute().inset_0()));
     };
     return v_flex().id("herdr-git").size_full().min_h(0).overflow_hidden().rounded(10).border_1().border_color(t.border)
       .bg(t.background).text_color(t.foreground).text_size(13)
@@ -1145,7 +1174,7 @@ class Sidebar {
   }
 
   empty(view) {
-    if (this.loading && !this.head.branch) return "Loading…";
+    if (this.loading && (!this.head.branch || view === "submodules")) return "Loading…";
     if (view === this.filterView && this.filterText) return "Nothing matches";
     return { files: "No changes", worktrees: "No worktrees", submodules: "No submodules", branches: "No branches", remotes: "No remotes", "remote-branches": "No branches", tags: "No tags", commits: "No commits yet", reflog: "No reflog", stash: "No stashes", status: "" }[view];
   }
