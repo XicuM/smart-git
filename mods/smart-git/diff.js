@@ -346,8 +346,9 @@ export class Diff {
     };
     // A labelled key ([label, fn]) is also in the ? list; a bare fn is an alias.
     const keys = this.conflict ? {
-      j: ["Next conflict", () => toConflict(this.ci + 1)], down: () => toConflict(this.ci + 1), k: ["Previous conflict", () => toConflict(this.ci - 1)], up: () => toConflict(this.ci - 1),
-      h: ["Side above (ours, base)", () => sideBy(-1)], left: () => sideBy(-1), l: ["Side below (base, theirs)", () => sideBy(1)], right: () => sideBy(1),
+      // As lazygit and the diff's own h/l (hunk) and j/k (line): across conflicts, then down the stacked sides.
+      h: ["Previous conflict", () => toConflict(this.ci - 1)], left: () => toConflict(this.ci - 1), l: ["Next conflict", () => toConflict(this.ci + 1)], right: () => toConflict(this.ci + 1),
+      k: ["Side above (ours, base)", () => sideBy(-1)], up: () => sideBy(-1), j: ["Side below (base, theirs)", () => sideBy(1)], down: () => sideBy(1),
       space: ["Resolve with the picked side", () => this.resolve(this.side, cx)], enter: () => this.resolve(this.side, cx), b: ["Keep both", () => this.resolve("both", cx)], z: ["Undo resolve", () => this.undoResolve(cx)],
     } : {
       j: ["Next line", () => this.step(1)], down: () => this.step(1), k: ["Previous line", () => this.step(-1)], up: () => this.step(-1),
@@ -477,7 +478,7 @@ export class Diff {
 
   hints() {
     const s = this.shown;
-    if (this.conflict) return "j/k conflict · h/l side (ours, base, theirs) · space pick · b both · z undo the last pick · esc back";
+    if (this.conflict) return "h/l conflict · j/k side (ours, base, theirs) · space pick · b both · z undo the last pick · esc back";
     const pick = "j/k line · ←/→ hunk · J/K file · v range · a hunk";
     if (s?.kind === "file") return `${pick} · space stage · d discard · e edit · f full file · z zoom · {/} context · esc back`;
     if (s?.kind === "commit") return `${pick} · space move out of commit · f full file · z zoom · esc back`;
