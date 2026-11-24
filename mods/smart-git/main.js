@@ -78,6 +78,25 @@ const EXPLAIN = {
     t: "Adds a new commit that undoes this one. Nothing is rewritten: safe on pushed branches.",
     V: "Applies the copied commits on top of the current branch as new commits; they may conflict.",
   },
+  branches: {
+    space: "Switches your files to this branch. Uncommitted changes come along when they don't clash; otherwise git refuses.",
+    f: "Moves this branch forward to its upstream when your commits are all already there. Never creates a merge commit.",
+    d: "Deletes the branch name only; commits stay in the reflog. Git refuses if it is not merged, and a second prompt can force it.",
+    R: "Renames the branch locally. Its upstream and any remote copy keep the old name.",
+    M: "Brings that branch's commits into the current one (a dialog offers merge, fast-forward only or squash). The other branch does not change; history is kept as it was.",
+    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear, but those commits get new hashes: a pushed branch then needs a force push. z undoes it.",
+    n: "Creates a new branch starting at this one and checks it out.",
+    W: "Shows what differs between this and what you have checked out, without changing anything. Press again to stop.",
+  },
+  "remote-branches": {
+    space: "Checks out a local branch tracking this one, creating it when it doesn't exist yet.",
+    u: "Makes this the upstream of your current branch, so p pulls from it and P pushes to it.",
+    d: "Deletes the branch on the remote itself, for everyone. Your local branches are untouched.",
+    M: "Brings that branch's commits into the current one (a dialog offers merge, fast-forward only or squash). The other branch does not change; history is kept as it was.",
+    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear, but those commits get new hashes: a pushed branch then needs a force push. z undoes it.",
+    n: "Creates a new branch starting at this one and checks it out.",
+    W: "Shows what differs between this and what you have checked out, without changing anything. Press again to stop.",
+  },
   todo: {
     p: "Keeps this commit as it is.",
     s: "Melds this commit into the one before it, keeping both messages.",
@@ -686,9 +705,10 @@ class Sidebar {
   async opMenu(op, { title = OPS[op], view = false } = {}, cx) {
     const cmd = !op ? null : op.startsWith("rebase") ? "rebase" : op === "MERGE_HEAD" ? "merge" : op === "CHERRY_PICK_HEAD" ? "cherry-pick" : "revert";
     const r = await ask({ title, detail: !view && this.files.some((f) => f.conflict) ? "There are still conflicts." : null, items: [
-      ...(view ? [{ key: "v", label: "View conflicts", value: "view" }] : [{ key: "c", label: "Continue", value: "--continue" }]),
-      ...(cmd ? [{ key: "a", label: `Abort the ${cmd}`, value: "--abort", danger: true }] : []),
-      ...(cmd && !view && cmd !== "merge" ? [{ key: "s", label: "Skip this commit", value: "--skip", danger: true }] : []),
+      ...(view ? [{ key: "v", label: "View conflicts", value: "view", hint: "Opens the first conflicted file. Pick ours, theirs or both for each conflict, stage the file, then press m again." }]
+        : [{ key: "c", label: "Continue", value: "--continue", hint: cmd === "merge" ? "Finishes the merge: commits what you staged. Resolve every conflict and stage those files first." : "Carries on with the next step, using the changes you staged for this one." }]),
+      ...(cmd ? [{ key: "a", label: `Abort the ${cmd}`, value: "--abort", danger: true, hint: `Throws away the ${cmd} and every conflict resolution so far. The branch goes back to how it was before you started.` }] : []),
+      ...(cmd && !view && cmd !== "merge" ? [{ key: "s", label: "Skip this commit", value: "--skip", danger: true, hint: "Leaves this commit's changes out and moves to the next one." }] : []),
     ] });
     if (!r) return;
     if (r === "view") {
@@ -793,19 +813,25 @@ class Sidebar {
     const mergeRebase = {
       M: ["Merge into the current branch", () => ref && act(`Merging ${ref}…`, async () => {
         // lazygit's merge options; squash leaves the changes staged, or commits them with git's message.
-        const r = await ask({ title: `Merge ${ref} into ${this.head.branch}`, items: [
-          { key: "m", label: "Merge (fast-forward when it can)", value: "merge" },
-          { key: "n", label: "Merge commit, even when it could fast-forward (--no-ff)", value: "--no-ff" },
-          { key: "f", label: "Fast-forward only (--ff-only)", value: "--ff-only" },
-          { key: "s", label: "Squash, leave the changes staged", value: "--squash" },
-          { key: "S", label: "Squash and commit", value: "squash-commit" },
+        const r = await ask({ title: `Merge ${ref} into ${this.head.branch}`,
+          detail: `Brings the commits of ${ref} into ${this.head.branch}. ${ref} itself never changes. Conflicts stop the merge for you to fix; m then continues or aborts it.`, items: [
+          { key: "m", label: "Merge (fast-forward when it can)", value: "merge",
+            hint: `The usual choice. If ${this.head.branch} has nothing ${ref} lacks, it just moves forward to ${ref}. Otherwise git makes a merge commit joining both histories.` },
+          { key: "n", label: "Merge commit, even when it could fast-forward (--no-ff)", value: "--no-ff",
+            hint: "Always makes a merge commit, so the history shows that these commits came from a branch. Same final files as the plain merge." },
+          { key: "f", label: "Fast-forward only (--ff-only)", value: "--ff-only",
+            hint: `Moves ${this.head.branch} forward to ${ref} and does nothing else. Fails, changing nothing, when the two have diverged.` },
+          { key: "s", label: "Squash, leave the changes staged", value: "--squash",
+            hint: `Stages everything ${ref} adds but makes no commit and no link to ${ref}. You commit it yourself, as one ordinary commit.` },
+          { key: "S", label: "Squash and commit", value: "squash-commit",
+            hint: `As above, then commits at once with git's message. ${ref}'s individual commits do not enter the history.` },
         ] });
         if (!r) return;
         await this.w(["merge", "--no-edit", ...(r === "merge" ? [] : r === "squash-commit" ? ["--squash"] : [r]), ref], { timeout: 120000 });
         if (r === "squash-commit") await this.w(["commit", "--no-edit"]);
       })],
       r: ["Rebase the current branch onto this", () => ref && act(`Rebasing onto ${ref}…`, async () => {
-        if (await confirm(`Rebase ${this.head.branch} onto ${ref}?`, null, "Rebase", false)) await this.w(["rebase", "--autostash", ref], { timeout: 120000 });
+        if (await confirm(`Rebase ${this.head.branch} onto ${ref}?`, `Your commits on ${this.head.branch} are replayed on top of ${ref}. Conflicts stop it, and m then continues, skips or aborts.`, "Rebase", false, EXPLAIN.branches.r)) await this.w(["rebase", "--autostash", ref], { timeout: 120000 });
       })],
     };
     const panelKeys = {
