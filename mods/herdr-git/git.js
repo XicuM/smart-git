@@ -228,29 +228,94 @@ export function parseConflicts(text) {
 }
 
 // Text draws a tab as nothing: pad each to the next 4-column stop.
-const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
+export const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
 
 // Unified diff text (possibly several files, possibly after a commit header) into rows:
-// kind "h" (header text), "f" (file name), "@" (hunk), "+", "-", " ". A +/- row keeps
-// `raw`, its line in `text`, for building patches.
+// kind "h" (header text), "f" (file: `path` its new side, null when deleted; `notes`, like
+// "renamed from x"), "@" (hunk: `text` its function, `line` where it starts), "g" (the unchanged
+// lines before a hunk: `from`..`to` on the new side, `old` the first one's number on the old),
+// "+", "-", " ". A +/- row keeps `raw`, its line in `text`, for building patches, and when it
+// pairs with a line of the other kind `hl`, the [start, end) of what changed in it.
+// `rows.truncated` is set when the diff was too long to show whole.
 export function diffRows(text) {
-  const rows = [], lines = text.replace(/\n$/, "").split("\n").slice(0, 20000);
-  let old = 0, next = 0, inHunk = false;
+  const all = text.replace(/\n$/, "").split("\n"), lines = all.slice(0, 20000), rows = [];
+  let old = 0, next = 0, inHunk = false, file = null, mode = null;
   for (let raw = 0; raw < lines.length; raw++) {
     const line = lines[raw];
     const cut = line.length > 4000 ? line.slice(0, 4000) + "…" : line;
-    const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(cut);
-    if (m) { old = +m[1]; next = +m[2]; inHunk = true; rows.push({ kind: "@", text: cut }); continue; }
-    if (cut.startsWith("diff --git ")) { inHunk = false; rows.push({ kind: "f", text: cut.replace(/^diff --git a\/(.*) b\/.*$/, "$1") }); continue; }
-    if (!inHunk) { if (!/^(index |--- |\+\+\+ |new file mode|deleted file mode|old mode|new mode|similarity|rename |dissimilarity)/.test(cut)) rows.push({ kind: "h", text: untab(cut) }); continue; }
+    const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)/.exec(cut);
+    if (m) {
+      // A side with no lines in the hunk names the line before it.
+      const at = +m[3] + (m[4] === "0" ? 1 : 0), n = at - next;
+      if (file?.path && n > 0) rows.push({ kind: "g", from: next, to: at - 1, old, path: file.path, text: `⋯ ${n} unchanged line${n > 1 ? "s" : ""}` });
+      old = +m[1] + (m[2] === "0" ? 1 : 0); next = at; inHunk = true; rows.push({ kind: "@", text: untab(m[5]), line: at }); continue;
+    }
+    if (cut.startsWith("diff --git ")) {
+      inHunk = false; old = next = 1; mode = null;
+      const path = cut.replace(/^diff --git a\/(.*) b\/.*$/, "$1");
+      rows.push(file = { kind: "f", text: path, path, notes: [] }); continue;
+    }
+    // `--submodule=log`: "Submodule <path> <a>..<b>:" then "  > added" / "  < removed" commits.
+    if (cut.startsWith("Submodule ")) { inHunk = false; file = null; rows.push({ kind: "f", text: cut }); continue; }
+    if (!inHunk && /^\s+[<>] /.test(cut)) { rows.push({ kind: "h", text: cut, tone: cut.trim()[0] === ">" ? "+" : "-" }); continue; }
+    if (!inHunk) {
+      let n;
+      if (file && cut.startsWith("+++ ")) { file.path = cut === "+++ /dev/null" ? null : cut.replace(/^\+\+\+ b\//, ""); file.text = file.path ?? file.text; }
+      else if (file && (n = /^(rename|copy) to (.*)/.exec(cut))) file.path = file.text = n[2];
+      else if (file && (n = /^(rename|copy) from (.*)/.exec(cut))) file.notes.push(`${n[1] === "rename" ? "renamed" : "copied"} from ${n[2]}`);
+      else if (file && /^new file mode/.test(cut)) file.notes.push("new file");
+      else if (file && /^deleted file mode/.test(cut)) file.notes.push("deleted");
+      else if (file && (n = /^old mode (\d+)/.exec(cut))) mode = n[1];
+      else if (file && (n = /^new mode (\d+)/.exec(cut))) file.notes.push(`mode ${mode} → ${n[1]}`);
+      else if (file && /^Binary files /.test(cut)) file.notes.push("binary");
+      else if (!/^(index |--- |similarity|dissimilarity)/.test(cut)) rows.push({ kind: "h", text: untab(cut) });
+      continue;
+    }
     const k = cut[0], body = untab(cut.slice(1)) || " ";
     if (k === "-") rows.push({ kind: "-", old: old++, text: body, raw });
     else if (k === "+") rows.push({ kind: "+", new: next++, text: body, raw });
     else if (k === " ") rows.push({ kind: " ", old: old++, new: next++, text: body });
     else rows.push({ kind: "h", text: cut });
   }
+  // A run of removals and the additions after it pair up, line by line, like side by side.
+  for (let i = 0; i < rows.length;) {
+    if (rows[i].kind !== "-") { i++; continue; }
+    const a = i; while (rows[i]?.kind === "-") i++;
+    const b = i; while (rows[i]?.kind === "+") i++;
+    for (let j = 0; j < Math.min(b - a, i - b); j++) markChange(rows[a + j], rows[b + j]);
+  }
+  if (all.length > lines.length) rows.truncated = all.length;
   return rows;
 }
+
+// Marks the part of two paired lines between what they share at the start and the end,
+// widened to whole words. A pair that shares nothing stays unmarked: the whole line changed.
+function markChange(x, y) {
+  const a = x.text, b = y.text, w = (c) => /\w/.test(c ?? "");
+  let p = 0, s = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  while (p > 0 && w(a[p - 1]) && (w(a[p]) || w(b[p]))) p--;
+  while (s > 0 && w(a[a.length - s]) && (w(a[a.length - s - 1]) || w(b[b.length - s - 1]))) s--;
+  if (p + s === 0) return;
+  x.hl = [p, a.length - s]; y.hl = [p, b.length - s];
+}
+
+// `git log --graph --decorate=full --format=LOG_GRAPH` into rows of kind "L": the graph, and the
+// commit's fields (none on a line of only graph). Refs carry a tone: head, local, remote, tag.
+export const LOG_GRAPH = "%x1f%h%x1f%D%x1f%s%x1f%an%x1f%ar";
+export const logRows = (text) => text.replace(/\n$/, "").split("\n").slice(0, 20000).map((l) => {
+  const [graph, hash = "", decor = "", subject = "", author = "", when = ""] = l.split("\x1f");
+  const refs = decor ? decor.split(", ").map((d) => {
+    const head = d.startsWith("HEAD -> "), name = head ? d.slice(8) : d;
+    if (name.startsWith("tag: ")) return { tone: "tag", name: name.slice(5).replace(/^refs\/tags\//, "") };
+    if (name.startsWith("refs/heads/")) return { tone: head ? "head" : "local", name: (head ? "HEAD → " : "") + name.slice(11) };
+    if (name.startsWith("refs/remotes/")) return { tone: "remote", name: name.slice(13) };
+    return { tone: name === "HEAD" ? "head" : "other", name: name.replace(/^refs\//, "") };
+  }).filter((r) => !r.name.endsWith("/HEAD")) : [];
+  return { kind: "L", graph: graph.trimEnd(), hash, refs, subject, author, when,
+    text: [graph, hash, ...refs.map((r) => r.name), subject, author, when].filter(Boolean).join("  ") };
+});
 
 // The same rows side by side: a run of removals pairs with the additions that follow it.
 export function splitRows(rows) {

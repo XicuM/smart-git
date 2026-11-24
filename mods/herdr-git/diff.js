@@ -5,11 +5,13 @@ import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { shared, theme, settings, run, setShared, exec, panes, focused } from "herdr";
 import { ask, keyOf } from "./ask.js";
-import { git, writeThere, rebaseWith, diffRows, splitRows, partialPatch, parseConflicts } from "./git.js";
+import { git, writeThere, rebaseWith, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
 
 const ROW = 20, CHAR = 7.3;
-const BANDS = ["s", "f", "@", "h", "<", "|", "=", ">"];
+const BANDS = ["s", "f", "@", "g", "h", "<", "|", "=", ">"];
 const isChange = (r) => r?.kind === "+" || r?.kind === "-";
+// Selections shown as a commit graph rather than a diff.
+const LOGS = ["branch", "remote", "status"];
 
 // Cuts a line into pieces of at most n characters, at a space when one is near the end.
 function wrapText(text, n) {
@@ -27,19 +29,21 @@ function wrapText(text, n) {
 
 // The git commands that show each kind of selection, as labelled sections.
 function sources(s, o) {
-  const flags = ["--no-color", `--submodule=${o.sub}`, `-U${o.context}`, ...(o.ws ? ["-w"] : [])];
+  // a/ and b/ whatever the user's config (diff.mnemonicPrefix, diff.noprefix): rows parse paths.
+  const flags = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", `--submodule=${o.sub}`, `-U${o.full ? 1000000 : o.context}`, ...(o.ws ? ["-w"] : [])];
   if (s.kind === "file") {
     const out = [], path = ["--", s.path];
     if (s.unstaged) out.push(["Unstaged changes", s.untracked ? ["diff", "--no-index", ...flags, "--", "/dev/null", s.path] : ["diff", ...flags, ...path]]);
     if (s.staged) out.push(["Staged changes", ["diff", "--cached", ...flags, ...path]]);
     return out;
   }
-  if (s.kind === "commit") return [[null, ["show", ...flags, "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%w(0,4,4)%B", s.hash]]];
+  if (s.kind === "commit") return [[null, ["show", ...flags, "--format=commit %H%d%nAuthor: %an <%ae>%nDate:   %ad (%ar)%n%n%w(0,4,4)%B", s.hash]]];
   if (s.kind === "range") return [[null, ["diff", ...flags, s.from, s.to]]];
   if (s.kind === "stash") return [[null, ["stash", "show", "-p", ...flags, "--include-untracked", s.ref]]];
-  if (s.kind === "branch") return [[null, ["log", "--graph", "--no-color", "--format=%h %s (%ar, %an)%d", "-n", "300", s.name, "--"]]];
-  if (s.kind === "remote") return [[null, ["log", "--graph", "--no-color", "--format=%h %s (%ar)%d", "-n", "300", `--remotes=${s.name}`]]];
-  return [[null, ["log", "--graph", "--no-color", "--all", "--format=%h %s (%ar)%d", "-n", "300"]]];
+  const log = ["log", "--graph", "--no-color", "--decorate=full", `--format=${LOG_GRAPH}`, "-n", "300"];
+  if (s.kind === "branch") return [[null, [...log, s.name, "--"]]];
+  if (s.kind === "remote") return [[null, [...log, `--remotes=${s.name}`]]];
+  return [[null, [...log, "--all"]]];
 }
 
 // A file's conflicts as rows: the plain lines, and each conflict's markers and sides (`c` its number).
@@ -64,8 +68,8 @@ const conflictText = (parts) => parts.flatMap((p) => Array.isArray(p) ? p
 export class Diff {
   constructor(view, cx) {
     this.view = view; this.rows = []; this.texts = []; this.width = 600;
-    this.split = shared("herdr-git:split") ?? false; this.wrap = shared("herdr-git:wrap") ?? true;
-    this.ws = shared("herdr-git:ws") ?? false; this.context = shared("herdr-git:context") ?? 3; this.sub = shared("herdr-git:sub") ?? "log";
+    this.layout = shared("herdr-git:layout") ?? "auto"; this.wrap = shared("herdr-git:wrap") ?? true;
+    this.ws = shared("herdr-git:ws") ?? false; this.context = shared("herdr-git:context") ?? 3; this.full = shared("herdr-git:full") ?? false; this.sub = shared("herdr-git:sub") ?? "log";
     this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = [];
     this.handle = cx.focus_handle();
     this.scroll = VirtualListScrollHandle.new();
@@ -74,14 +78,23 @@ export class Diff {
   // What the sidebar selected; reloads when it (or how it's shown) changes. Render calls this.
   sync(cx) {
     const s = shared("herdr-git:show");
-    const key = JSON.stringify([s, this.ws, this.context, this.sub]);
+    const key = JSON.stringify([s, this.ws, this.context, this.sub, this.full]);
     if (!s || key === this.loaded) return;
     // The same thing again (changed on disk, or a line staged): keep the place.
     const same = s.kind === this.shown?.kind && s.title === this.shown?.title;
+    if (!same) this.open = new Set();
     this.loaded = key; this.shown = s; this.title = s.title; this.error = null;
     cx.spawn(async (cx) => {
-      const rows = [], texts = [];
-      let conflict = null;
+      const rows = [], texts = [], files = new Map();
+      let conflict = null, truncated = 0;
+      // A file's lines on the new side of a section, for the gaps that were opened.
+      const newSide = async (label, path) => {
+        const spec = label === "Unstaged changes" ? "" : label === "Staged changes" ? `:${path}` : s.kind === "commit" ? `${s.hash}:${path}`
+          : s.kind === "range" ? `${s.to}:${path}` : s.kind === "stash" ? `${s.ref}:${path}` : null;
+        if (spec === null) return null;
+        const text = spec ? await git(s.repo, ["show", spec]) : (await exec("cat", ["--", path], { cwd: s.repo.root, on: s.repo.on })).stdout;
+        return text.split("\n");
+      };
       try {
         if (s.kind === "conflict") {
           const r = await exec("cat", ["--", s.path], { cwd: s.repo.root, on: s.repo.on });
@@ -93,11 +106,33 @@ export class Diff {
           if (label && !text.trim()) continue;
           if (label) rows.push({ kind: "s", text: label });
           const src = texts.push({ label, text }) - 1;
-          rows.push(...diffRows(text).map((r) => ({ ...r, src })));
+          if (LOGS.includes(s.kind)) { rows.push(...logRows(text)); continue; }
+          const d = diffRows(text);
+          truncated = Math.max(truncated, d.truncated ?? 0);
+          for (const r of d) {
+            const gap = r.kind === "g" ? `${label}|${r.path}|${r.from}` : null;
+            if (gap && this.open.has(gap)) {
+              const k = `${label}|${r.path}`;
+              if (!files.has(k)) files.set(k, await newSide(label, r.path).catch(() => null));
+              const lines = files.get(k);
+              if (lines) { for (let n = r.from; n <= r.to; n++) rows.push({ kind: " ", old: r.old + n - r.from, new: n, text: untab(lines[n - 1] ?? "") || " ", src }); continue; }
+            }
+            rows.push({ ...r, src, gap });
+          }
         }
       } catch (e) { if (this.loaded === key) this.error = String(e.message ?? e); }
       if (this.loaded !== key) return;
+      this.truncated = truncated;
+      // Rows added above (a gap opened) keep the cursor on its line while the section is the same.
+      const at = this.rows[this.cur];
+      if (same && at?.raw !== undefined && texts[at.src]?.text === this.texts[at.src]?.text) {
+        const n = rows.findIndex((r) => r.src === at.src && r.raw === at.raw);
+        const a = this.anchor !== null ? rows.findIndex((r) => r.src === at.src && r.raw === this.rows[this.anchor]?.raw) : -1;
+        if (n >= 0) { this.cur = n; this.anchor = a >= 0 ? a : null; }
+      }
       rows.forEach((r, i) => { r.i = i; });
+      // A commit's subject: the first message line under its header.
+      if (s.kind === "commit") { const t = rows.find((r) => r.kind === "h" && /^ {4}\S/.test(r.text)); if (t) t.title = true; }
       this.rows = rows; this.texts = texts; this.conflict = conflict; this.pairs = null; this.vis = null;
       this.longest = rows.reduce((n, r) => Math.max(n, r.text.length), 0);
       if (!same) { this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = []; this.scroll.scroll_to_item(0); }
@@ -127,18 +162,23 @@ export class Diff {
     return rows.slice(a, b + 1).filter((r) => isChange(r) && r.src === rows[c].src);
   }
 
-  // Moves the cursor to the next changed line that way, or the first one of the next hunk.
+  // Moves the cursor to the next changed line that way (the next hunk's, selecting hunks).
   step(dir) {
+    if (this.hunk) return this.jump("@", dir);
     const rows = this.rows;
-    let i = this.cur;
-    if (this.hunk) {
-      while (i > 0 && rows[i].kind !== "@") i--;
-      do i += dir; while (i >= 0 && i < rows.length && rows[i].kind !== "@");
-      if (i < 0 || i >= rows.length) return;
-      dir = 1;
-    }
-    for (i += dir; i >= 0 && i < rows.length; i += dir) if (isChange(rows[i])) { this.cur = i; break; }
+    for (let i = this.cur + dir; i >= 0 && i < rows.length; i += dir) if (isChange(rows[i])) { this.cur = i; break; }
     this.reveal(this.cur);
+  }
+
+  // Moves the cursor to the first changed line of the next hunk ("@") or file ("f") that way.
+  jump(kind, dir) {
+    const rows = this.rows;
+    let i = Math.min(this.cur, rows.length - 1);
+    while (i >= 0 && rows[i].kind !== kind) i--;
+    do i += dir; while (i >= 0 && i < rows.length && rows[i].kind !== kind);
+    if (i < 0 || i >= rows.length) return;
+    const n = rows.findIndex((r, j) => j > i && isChange(r));
+    if (n >= 0) { this.cur = n; this.reveal(n); }
   }
 
   reveal(index) {
@@ -271,18 +311,31 @@ export class Diff {
       g: () => { this.cur = -1; this.step(1); }, G: () => { this.cur = this.rows.length; this.step(-1); },
       v: () => { this.anchor = this.anchor === null ? this.cur : null; this.hunk = false; },
       a: () => { this.hunk = !this.hunk; this.anchor = null; },
-      ...(s.kind === "file" ? { space: () => this.stageLines(cx), d: () => this.discardLines(cx) } : {}),
+      ...(s.kind === "file" ? { space: () => this.stageLines(cx), d: () => this.discardLines(cx), e: () => run("herdr-git.edit") } : {}),
       ...(s.kind === "commit" ? { space: () => this.commitPatch(cx), "ctrl-p": () => this.commitPatch(cx) } : {}),
-      h: () => this.back(),
+      // Lazygit's hunk keys; files have none there, so J/K (its keys to scroll this panel).
+      h: () => this.jump("@", -1), left: () => this.jump("@", -1), l: () => this.jump("@", 1), right: () => this.jump("@", 1),
+      K: () => this.jump("f", -1), J: () => this.jump("f", 1),
     };
     const common = {
-      s: () => this.toggle("split"), w: () => this.toggle("wrap"), "ctrl-w": () => this.toggle("ws"),
+      s: () => this.setLayout({ auto: "split", split: "unified", unified: "auto" }[this.layout]), w: () => this.toggle("wrap"), "ctrl-w": () => this.toggle("ws"), f: () => this.toggle("full"),
       S: () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("herdr-git:sub", this.sub); },
       "{": () => { this.context = Math.max(0, this.context - 1); setShared("herdr-git:context", this.context); },
       "}": () => { this.context++; setShared("herdr-git:context", this.context); },
       z: () => this.zoom(),
+      // Side by side, unwrapped: both halves sideways, as lazygit's H/L.
+      H: () => { this.dx -= 8 * CHAR; }, L: () => { this.dx += 8 * CHAR; },
       escape: () => { if (this.anchor !== null || this.hunk) { this.anchor = null; this.hunk = false; } else this.back(); },
       q: () => this.back(),
+      // The sidebar's ? lists every key; here, the diff's. Picking one runs it.
+      "?": () => cx.spawn(async (cx) => {
+        const keys = [["j", "Next line"], ["k", "Previous line"], ["g", "First line"], ["G", "Last line"], ["v", "Select lines"], ["a", "Hunk mode"],
+          ["space", "Stage lines (file)"], ["d", "Discard lines (file)"], ["e", "Edit file (file)"], ["h", "Previous hunk"], ["l", "Next hunk"],
+          ["K", "Previous file"], ["J", "Next file"], ["s", "Change layout"], ["w", "Wrap lines"], ["ctrl-w", "Ignore whitespace"], ["f", "Whole file"],
+          ["S", "Toggle submodule diff"], ["{", "Less context"], ["}", "More context"], ["z", "Zoom"], ["H", "Scroll left"], ["L", "Scroll right"], ["q", "Back"]];
+        const k = await ask({ title: "Keys", items: keys.map(([value, label]) => ({ key: "", label: `${value}  ${label}`, value })) });
+        if (k) { this.key(k, cx); cx.notify(); }
+      }),
     };
     const a = keys[k] ?? common[k];
     if (!a) return false;
@@ -296,33 +349,46 @@ export class Diff {
   // Back to the sidebar, and the layout back as it was.
   back() { if (this.pane()?.zoomed) this.zoom(); run("pane.go", { direction: "right" }); }
 
+  isLog() { return LOGS.includes(this.shown?.kind); }
+  wrapped() { return this.wrap; }
+  // "split", "unified", or "auto": side by side once the pane is as wide as VS Code's breakpoint.
+  sideBySide() { return !this.conflict && !this.isLog() && (this.layout === "split" || (this.layout === "auto" && this.width >= 900)); }
+  setLayout(layout) { this.layout = layout; setShared("herdr-git:layout", layout); this.vis = null; }
+
   toggle(what) { this[what] = !this[what]; setShared(`herdr-git:${what}`, this[what]); this.vis = null; }
 
   // The rows as drawn: wrapped to the pane's width (each piece its own row, so every row
   // keeps the list's one height), or as they are, for scrolling sideways.
   visual() {
-    const split = this.split && !this.conflict;
+    const split = this.sideBySide();
     const pairs = split ? (this.pairs ??= splitRows(this.rows)) : null;
-    if (!this.wrap) return pairs ?? this.rows;
+    if (!this.wrapped()) return pairs ?? this.rows;
     const key = `${split}|${Math.round(this.width)}|${this.rows.length}`;
     if (this.vis?.key === key && this.vis.rows0 === this.rows) return this.vis.rows;
     const out = [], full = Math.floor((this.width - 24) / CHAR);
-    // A piece after the first keeps its row's kind and place, without its line numbers.
-    const piece = (r, text, n) => n === 0 ? { ...r, text } : { kind: r.kind, text, i: r.i, c: r.c, side: r.side };
-    const bandRows = (r) => wrapText(r.text, full).map((text, n) => piece(r, text, n));
+    // A piece after the first keeps its row's kind and place, without its line numbers; `off`
+    // is where it starts in the line, for the changed part.
+    const pieces = (r, n) => {
+      let off = 0;
+      return wrapText(r.text, n).map((text, j) => {
+        const p = j === 0 ? { ...r, text } : { kind: r.kind, text, i: r.i, c: r.c, side: r.side, gap: r.gap, hl: r.hl, off };
+        off += text.length;
+        return p;
+      });
+    };
     if (!pairs) {
       const n = Math.floor((this.width - 110) / CHAR);
       for (const r of this.rows) {
-        if (BANDS.includes(r.kind)) { out.push(...bandRows(r)); continue; }
-        wrapText(r.text, n).forEach((text, j) => out.push(piece(r, text, j)));
+        if (r.kind === "L") { out.push(r); continue; }
+        out.push(...pieces(r, BANDS.includes(r.kind) ? full : n));
       }
     } else {
       const n = Math.floor((Math.floor(this.width / 2) - 56) / CHAR);
       for (const p of pairs) {
-        if (p.kind !== "~" && BANDS.includes(p.kind)) { out.push(...bandRows(p.left).map((r) => ({ kind: r.kind, left: r, right: r }))); continue; }
-        const L = p.left ? wrapText(p.left.text, n) : [], R = p.right ? wrapText(p.right.text, n) : [];
+        if (p.kind !== "~" && BANDS.includes(p.kind)) { out.push(...pieces(p.left, full).map((r) => ({ kind: r.kind, left: r, right: r }))); continue; }
+        const L = p.left ? pieces(p.left, n) : [], R = p.right ? pieces(p.right, n) : [];
         // A side that runs out keeps its color on blank rows; a missing side stays missing.
-        const side = (r, parts, j) => !r ? null : piece(r, parts[j] ?? "", j);
+        const side = (r, parts, j) => !r ? null : parts[j] ?? { kind: r.kind, text: "", i: r.i, c: r.c, side: r.side };
         for (let j = 0; j < Math.max(L.length, R.length, 1); j++) out.push({ kind: p.kind, left: side(p.left, L, j), right: side(p.right, R, j) });
       }
     }
@@ -333,66 +399,151 @@ export class Diff {
   hints() {
     const s = this.shown;
     if (this.conflict) return "j/k conflict · h/l side · space pick · b both · z undo the last pick · esc back";
-    const pick = "j/k line · v range · a hunk";
-    if (s?.kind === "file") return `${pick} · space stage · d discard · z zoom · {/} context · esc back`;
-    if (s?.kind === "commit") return `${pick} · space move out of commit · z zoom · esc back`;
-    return "s side by side · w wrap · z zoom · {/} context · esc back";
+    const pick = "j/k line · ←/→ hunk · J/K file · v range · a hunk";
+    if (s?.kind === "file") return `${pick} · space stage · d discard · e edit · f full file · z zoom · {/} context · esc back`;
+    if (s?.kind === "commit") return `${pick} · space move out of commit · f full file · z zoom · esc back`;
+    if (s?.kind === "range" || s?.kind === "stash") return "j/k line · ←/→ hunk · J/K file · s layout · f full file · w wrap · z zoom · {/} context · esc back";
+    if (this.isLog()) return "w wrap · z zoom · esc back";
+    return "s layout · f full file · w wrap · z zoom · {/} context · esc back";
   }
 
   render(cx) {
     this.sync(cx);
     const t = theme(), mono = settings().font_family ?? "JetBrains Mono", focused = this.handle.is_focused();
-    const split = this.split && !this.conflict;
+    const split = this.sideBySide();
     // Wide enough for the longest line, so the pane scrolls sideways instead of cutting it.
-    const text = this.wrap ? 0 : Math.ceil((this.longest ?? 0) * CHAR);
-    const half = Math.max(200, Math.floor(this.width / 2), text + 50);
-    const wide = this.wrap ? this.width : split ? half * 2 + 1 : Math.max(this.width, text + 110);
+    const text = this.wrapped() ? 0 : Math.ceil((this.longest ?? 0) * CHAR);
+    // Side by side, both halves and the divider fit the pane exactly, the divider in the middle.
+    const half = Math.floor((this.width - 1) / 2);
+    const wide = this.wrapped() || split ? this.width : Math.max(this.width, text + 110);
+    // Side by side, unwrapped: each half's code scrolls sideways under its fixed line numbers,
+    // both halves together (`dx`), as VS Code does.
+    const sideways = split && !this.wrap, zoom = Number(settings().zoom) || 1;
+    const view = half - 46, content = text + 20, maxDx = sideways ? Math.max(0, content - view) : 0;
+    this.dx = Math.max(0, Math.min(this.dx ?? 0, maxDx));
+    const track = view - 12, thumb = Math.max(24, track * view / Math.max(content, 1));
+    // Shift+wheel may arrive already turned sideways (delta.x), as on Linux.
+    const wheel = (ev, cx) => {
+      const d = ev.modifiers?.shift ? (ev.delta.y || ev.delta.x) : Math.abs(ev.delta.x) > Math.abs(ev.delta.y) ? ev.delta.x : 0;
+      if (!d) return;
+      this.dx -= d / zoom; cx.stop_propagation(); cx.notify();
+    };
+    const bar = (left) => div().absolute().bottom(2).left(left + 46).w(track).h(6)
+      .child(div().id(`thumb-${left}`).absolute().top_0().h_full().left(maxDx ? this.dx / maxDx * (track - thumb) : 0).w(thumb).rounded(3)
+        .bg(this.drag ? t.muted : t.dim).opacity(0.6).hover((e) => e.opacity(0.9))
+        .on_mouse_down("left", (e, cx) => { this.drag = { x: e.position.x, dx: this.dx, k: maxDx / Math.max(1, track - thumb) }; cx.stop_propagation(); cx.notify(); }));
     const rows = this.visual(), picked = new Set(focused ? this.selected().map((r) => r.i) : []);
-    const num = (n) => div().w(40).flex_none().text_right().pr(8).text_color(t.dim).child(n === undefined ? "" : String(n));
+    // A changed line's own color: faint over the line, strong on what changed in it and its gutter.
+    const hue = (r) => r?.kind === "+" ? t.ansi2 : r?.kind === "-" ? t.ansi1 : null;
+    const strong = (r) => isChange(r) ? hue(r) + "66" : null;
+    const num = (n, r) => div().w(40).flex_none().h_full().text_right().pr(8).text_color(strong(r) ? t.foreground : t.dim).when(Boolean(strong(r)), (e) => e.bg(strong(r)))
+      .child(n === undefined ? "" : String(n));
     const bg = (r) => {
       if (picked.has(r.i)) return t.selection;
       if (r.side) return r.c === this.ci && r.side === this.side && focused ? t.selection : (r.side === "ours" ? t.ansi2 : t.ansi4) + "22";
       return r.kind === "+" ? t.ansi2 + "22" : r.kind === "-" ? t.ansi1 + "22" : r.kind === "b" ? t.surface : null;
     };
+    // Lazygit's colors: lanes cycle, refs by kind (git's own), an author keeps one color.
+    const lanes = [t.ansi4, t.ansi5, t.ansi6, t.ansi2, t.ansi3, t.ansi1];
+    const refColor = { head: t.ansi6, local: t.ansi2, remote: t.ansi1, tag: t.ansi3, other: t.dim };
+    const authorColor = (name) => lanes[[...name].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7) % lanes.length];
+    const glyph = { "*": "●", "|": "│" };
+    // The hash first, in a fixed column, so it lines up however wide the graph is.
+    const logLine = (r) => h_flex().h(ROW).flex_none().w_full().px(10).gap(8).whitespace_nowrap()
+      .child(div().w(CHAR * 9).flex_none().text_color(t.ansi3).child(r.hash))
+      .child(h_flex().flex_none().children([...r.graph].map((ch, i) => div().w(CHAR).flex_none().text_color(lanes[Math.floor(i / 2) % lanes.length]).child(glyph[ch] ?? ch))))
+      .when(Boolean(r.hash), (e) => e
+        .children(r.refs.map((ref) => div().flex_none().font_semibold().text_color(refColor[ref.tone]).child(ref.name)))
+        .child(div().flex_1().min_w(0).truncate().child(r.subject))
+        .child(div().flex_none().text_color(authorColor(r.author)).child(r.author))
+        .child(div().w(CHAR * 10).flex_none().text_right().text_color(t.dim).child(r.when.replace(/, \d+ months?/, "").replace(/ ago$/, ""))));
+    // A commit's header: labels dim, hash and refs in color, the message in full ink.
+    const header = (r) => {
+      const row = h_flex().px(10).h(ROW).flex_none().whitespace_nowrap();
+      if (r.tone) return row.text_color(r.tone === "+" ? t.ansi2 : t.ansi1).child(r.text);
+      const c = /^commit ([0-9a-f]+)(.*)$/.exec(r.text), m = /^(Author:|Date:|Merge:)(.*)$/.exec(r.text);
+      if (c) return row.child(div().text_color(t.dim).child("commit ")).child(div().text_color(t.ansi3).child(c[1])).child(div().font_semibold().text_color(t.ansi6).child(c[2]));
+      if (m) return row.child(div().text_color(t.dim).child(m[1])).child(div().child(m[2]));
+      return row.when(Boolean(r.title), (e) => e.font_semibold()).child(r.text);
+    };
     const band = (r) => {
       if (r.kind === "s") return div().px(10).h(ROW).flex_none().bg(t.raised).text_color(t.accent).font_semibold().child(r.text);
-      if (r.kind === "f") return div().px(10).h(ROW).flex_none().bg(t.raised).text_color(t.foreground).font_semibold().truncate().child(r.text);
-      if (r.kind === "@") return div().px(10).h(ROW).flex_none().text_color(t.dim).truncate().child(r.text);
-      if (r.kind === "h") return div().px(10).h(ROW).flex_none().text_color(t.muted).whitespace_nowrap().child(r.text);
+      if (r.kind === "f") return h_flex().px(10).gap(10).h(ROW).flex_none().bg(t.raised).whitespace_nowrap()
+        .child(div().flex_none().text_color(t.foreground).font_semibold().child(r.text))
+        .children((r.notes ?? []).map((n) => div().flex_none().text_color(t.blocked).child(n)));
+      // A hunk: the line it starts at and the function it's in (click selects it).
+      if (r.kind === "@") return h_flex().px(10).gap(10).h(ROW).flex_none().whitespace_nowrap().cursor_pointer()
+        .child(div().flex_none().text_color(t.dim).child(r.line === undefined ? "" : `L${r.line}`))
+        .child(div().text_color(t.muted).child(r.text));
+      if (r.kind === "g") return div().px(10).h(ROW).flex_none().bg(t.surface).text_color(t.accent).cursor_pointer().whitespace_nowrap().child(r.text);
+      if (r.kind === "h") return header(r);
+      if (r.kind === "L") return logLine(r);
       if (["<", "|", "=", ">"].includes(r.kind)) return h_flex().h(ROW).flex_none().text_color(r.c === this.ci ? t.blocked : t.dim).child(num(r.new)).child(div().w(14).flex_none()).child(div().whitespace_nowrap().child(r.text));
       return null;
     };
+    // A line's text, with the part that changed from its paired line (`hl`) in a stronger color.
+    const code = (r) => {
+      const o = r?.off ?? 0, a = r?.hl ? Math.max(0, r.hl[0] - o) : 0, b = r?.hl ? Math.min(r.text.length, r.hl[1] - o) : 0;
+      if (a >= b) return div().whitespace_nowrap().child(r ? r.text : "");
+      return h_flex().whitespace_nowrap().child(div().flex_none().child(r.text.slice(0, a)))
+        .child(div().flex_none().rounded(2).bg(strong(r)).child(r.text.slice(a, b)))
+        .child(div().flex_none().child(r.text.slice(b)));
+    };
     const unified = (r, v) => band(r) ?? h_flex().id(`v-${v}`).h(ROW).flex_none().w_full().when(Boolean(bg(r)), (e) => e.bg(bg(r)))
-      .on_click((_e, cx) => { this.handle.focus(); if (isChange(this.rows[r.i])) { this.cur = r.i; } if (r.side) { this.ci = r.c; this.side = r.side; } cx.notify(); })
-      .child(num(r.old)).child(num(r.new))
-      .child(div().w(14).flex_none().text_color(r.kind === "+" ? t.ansi2 : r.kind === "-" ? t.ansi1 : t.dim).child(isChange(r) ? r.kind : ""))
-      .child(div().whitespace_nowrap().child(r.text));
+      .child(num(r.old, r)).child(num(r.new, r))
+      .child(div().w(14).flex_none().h_full().when(Boolean(strong(r)), (e) => e.bg(strong(r))).child(isChange(r) ? r.kind : ""))
+      .child(div().w(6).flex_none())
+      .child(code(r));
     const side = (r, which) => h_flex().w(half).flex_none().h_full().overflow_hidden().when(Boolean(r && bg(r)), (e) => e.bg(bg(r))).when(!r, (e) => e.bg(t.surface))
-      .child(num(r ? (which === "left" ? r.old : r.new) : undefined))
-      .child(div().whitespace_nowrap().child(r ? r.text : ""));
+      .child(num(r ? (which === "left" ? r.old : r.new) : undefined, r))
+      .child(div().w(6).flex_none())
+      .child(code(r).flex_none().ml(-this.dx));
     // A "~" pair may have only one side (lines added with none removed): never band it.
     const paired = (p, v) => (p.kind !== "~" && band(p.left)) || h_flex().id(`v-${v}`).h(ROW).flex_none().w_full()
-      .on_click((_e, cx) => { this.handle.focus(); const r = p.right ?? p.left; if (r && isChange(this.rows[r.i])) this.cur = r.i; cx.notify(); })
       .child(side(p.left, "left")).child(div().w(1).h_full().bg(t.border)).child(side(p.right, "right"));
-    const button = (id, name, on) => div().id(id).size(24).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover))
+    // A toggle: its icon is what it does, lit while it's on.
+    const button = (id, name, active, tip, on) => div().id(id).tooltip(tip).size(24).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_color(active ? t.foreground : t.dim).when(active, (e) => e.bg(t.selection)).hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => { on(); cx.notify(); }).child(svg(`mods/herdr-git/${name}.svg`).size(14));
     return v_flex().id("herdr-git-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12)
       .track_focus(this.handle).on_key_down((e, cx) => { if (this.key(keyOf(e), cx)) cx.stop_propagation(); })
-      .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } })
+      // Sizes come back zoomed; lengths given to elements get zoomed again, so measure unzoomed.
+      .on_mouse_move((e, cx) => { if (this.drag) { this.dx = this.drag.dx + (e.position.x - this.drag.x) / zoom * this.drag.k; cx.notify(); } })
+      .on_mouse_up("left", (_e, cx) => { if (this.drag) { this.drag = null; cx.notify(); } })
+      .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
       .child(h_flex().h(32).flex_none().px(10).gap(2).items_center().border_b(1).border_color(t.border)
-        .child(div().flex_1().min_w(0).truncate().font_semibold().child((this.title ?? "Select something in the git panel") + ` [rows=${this.rows.length} vis=${rows.length} w=${this.width} loaded=${Boolean(this.loaded)} err=${this.error}]`))
+        .child(div().flex_1().min_w(0).truncate().font_semibold().child(this.title ?? "Select something in the git panel"))
         .when(this.ws, (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child("ignoring whitespace")))
-        .when(this.context !== 3, (e) => e.child(div().px(6).text_size(11).text_color(t.dim).child(`${this.context} lines of context`)))
-        .child(button("wrap", this.wrap ? "wrap-text" : "align-left", () => this.toggle("wrap")))
-        .when(!this.conflict, (e) => e.child(button("split", this.split ? "columns-2" : "rows-2", () => this.toggle("split")))))
+        .when(this.context !== 3 && !this.full, (e) => e.child(div().px(6).text_size(11).text_color(t.dim).child(`${this.context} lines of context`)))
+        .when(Boolean(this.truncated), (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child(`only the first 20000 of ${this.truncated} lines`)))
+        // The whole file (git with unlimited context), or only the changes and a few lines round them.
+        .when(!this.conflict && !this.isLog(), (e) => e.child(button("full", "unfold-vertical", this.full, "Show the whole file (f)", () => this.toggle("full"))))
+        .child(button("wrap", "wrap-text", this.wrap, "Wrap long lines (w)", () => this.toggle("wrap")))
+        .when(!this.conflict && !this.isLog(), (e) => e.child(div().w(1).h(16).mx(4).bg(t.border))
+          .child(button("unified", "rows-2", this.layout === "unified", "Unified: old and new lines in one column (s)", () => this.setLayout("unified")))
+          .child(button("split", "columns-2", this.layout === "split", "Side by side: old left, new right (s)", () => this.setLayout("split")))
+          .child(button("auto", "move-horizontal", this.layout === "auto", "Auto: side by side when the pane is wide enough (s)", () => this.setLayout("auto")))))
       .when(Boolean(this.error), (e) => e.child(div().id("error").p(10).text_color(t.ansi1).cursor_pointer().on_click((_e, cx) => { this.error = null; cx.notify(); }).child(this.error)))
       .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child("No conflict markers left. M in the files list keeps one side of the whole file.")))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
-        .child(div().id("herdr-git-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(wide).h_full().child(v_virtual_list("herdr-git-rows", rows.length, ROW, (i) => String(i),
-            (range) => rows.slice(range.start, range.end).map((r, k) => h_flex().h(ROW).flex_none().w_full().child(num(r.old)).child(num(r.new)).child(div().whitespace_nowrap().child(r.text ?? "")))).track_scroll(this.scroll).size_full())))
-        .child(Scrollbar.vertical("herdr-git-rows").viewport_from_layout().absolute().inset_0()))
+        .child(div().id("herdr-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
+          .when(sideways, (e) => e.on_scroll_wheel(wheel))
+          // Where a press lands says which side of a row was clicked: the list only names the row.
+          .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); })
+            .child(v_virtual_list("herdr-git-rows", rows.length, ROW, (i) => String(i),
+            (range) => rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k))).track_scroll(this.scroll).size_full()
+            .on_item_click((key, cx) => {
+              const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
+              this.handle.focus();
+              if (r?.kind === "g" && r.gap) { this.open.add(r.gap); this.loaded = null; }
+              if (r?.kind === "@") { const n = this.rows.findIndex((x, j) => j > r.i && isChange(x)); if (n >= 0) { this.cur = n; this.hunk = true; this.anchor = null; } }
+              if (r && isChange(this.rows[r.i])) this.cur = r.i;
+              if (r?.side) { this.ci = r.c; this.side = r.side; }
+              cx.notify();
+            }))))
+        .child(Scrollbar.vertical("herdr-git-rows").viewport_from_layout().absolute().inset_0())
+        .when(sideways && maxDx > 0, (e) => e.child(bar(0)).child(bar(half + 1))))
       .child(div().flex_none().px(12).py(5).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim).truncate()
-        .child(this.busy ? "Working…" : (this.anchor !== null ? "range · " : this.hunk ? "hunk · " : "") + this.hints()));
+        .child(this.busy ? "Working…" : (this.anchor !== null ? "range · " : this.hunk ? "hunk · " : "") + (sideways ? "H/L scroll · " : "") + this.hints()));
   }
 }
