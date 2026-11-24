@@ -330,21 +330,63 @@ function markChange(x, y) {
   x.hl = [p, a.length - s]; y.hl = [p, b.length - s];
 }
 
-// `git log --graph --decorate=full --format=LOG_GRAPH` into rows of kind "L": the graph, and the
-// commit's fields (none on a line of only graph). Refs carry a tone: head, local, remote, tag.
-export const LOG_GRAPH = "%x1f%h%x1f%D%x1f%s%x1f%an%x1f%ar";
-export const logRows = (text) => text.replace(/\n$/, "").split("\n").slice(0, 20000).map((l) => {
-  const [graph, hash = "", decor = "", subject = "", author = "", when = ""] = l.split("\x1f");
-  const refs = decor ? decor.split(", ").map((d) => {
-    const head = d.startsWith("HEAD -> "), name = head ? d.slice(8) : d;
-    if (name.startsWith("tag: ")) return { tone: "tag", name: name.slice(5).replace(/^refs\/tags\//, "") };
-    if (name.startsWith("refs/heads/")) return { tone: head ? "head" : "local", name: (head ? "HEAD → " : "") + name.slice(11) };
-    if (name.startsWith("refs/remotes/")) return { tone: "remote", name: name.slice(13) };
-    return { tone: name === "HEAD" ? "head" : "other", name: name.replace(/^refs\//, "") };
-  }).filter((r) => !r.name.endsWith("/HEAD")) : [];
-  return { kind: "L", graph: graph.trimEnd(), hash, refs, subject, author, when,
-    text: [graph, hash, ...refs.map((r) => r.name), subject, author, when].filter(Boolean).join("  ") };
-});
+// `git log --date-order --decorate=full --format=LOG_GRAPH` into rows of kind "L", laid out on lanes.
+// Refs become labels: the checked out branch (tone "head"), a local branch with the remotes that
+// have it on the same commit (`main | origin`), remote branches, tags. `view` is the sidebar list
+// that acts on a label.
+export const LOG_GRAPH = "%H%x1f%h%x1f%P%x1f%D%x1f%s%x1f%an%x1f%ar";
+export const logRows = (text) => {
+  const rows = text.split("\n").filter(Boolean).slice(0, 20000).map((l) => {
+    const [hash, short, parents, decor, subject, author, when] = l.split("\x1f");
+    const refs = decor ? decor.split(", ") : [];
+    const remotes = refs.filter((d) => d.startsWith("refs/remotes/") && !d.endsWith("/HEAD")).map((d) => d.slice(13)), paired = new Set();
+    const labels = [];
+    for (const d of refs) {
+      const head = d.startsWith("HEAD -> "), ref = head ? d.slice(8) : d;
+      if (d === "HEAD") labels.push({ tone: "head", name: "HEAD" });
+      else if (ref.startsWith("refs/heads/")) {
+        const name = ref.slice(11), mates = remotes.filter((r) => r.slice(r.indexOf("/") + 1) === name);
+        mates.forEach((r) => paired.add(r));
+        labels.push({ tone: head ? "head" : "local", name, view: "branches", remotes: mates.map((r) => r.slice(0, r.indexOf("/"))) });
+      }
+    }
+    for (const r of remotes) if (!paired.has(r)) labels.push({ tone: "remote", name: r, view: "remote-branches" });
+    for (const d of refs) if (d.startsWith("tag: ")) labels.push({ tone: "tag", name: d.slice(5).replace(/^refs\/tags\//, ""), view: "tags" });
+    labels.sort((a, b) => Number(b.tone === "head") - Number(a.tone === "head"));
+    return { kind: "L", hash, short, parents: parents ? parents.split(" ") : [], head: labels[0]?.tone === "head", refs: labels, subject, author, when,
+      text: [short, ...labels.map((r) => r.name), subject, author, when].join("  ") };
+  });
+  // Lanes, after herdr-git-graph's lanes.js (MIT, github.com/rabeeh-ta/herdr-git-graph). A lane is a
+  // column waiting for one commit and keeps its column until that commit comes, so lines bend only
+  // where branches fork or merge. Each row gets its lane and segments [fromLane, fromY, toLane, toY,
+  // colorLane], y 0 the row's top, 0.5 its dot, 1 its bottom. Needs every child before its parents.
+  const lanes = [], free = () => { const i = lanes.indexOf(null); return i < 0 ? lanes.length : i; };
+  let width = 1;
+  for (const r of rows) {
+    const before = lanes.slice();
+    r.segments = [];
+    r.lane = before.indexOf(r.hash);
+    if (r.lane < 0) { r.lane = free(); lanes[r.lane] = r.hash; } // a branch tip: nothing above it
+    before.forEach((hash, j) => {
+      if (hash == null) return;
+      if (hash !== r.hash) return r.segments.push([j, 0, j, 1, j]);
+      r.segments.push([j, 0, r.lane, 0.5, j]);
+      if (j !== r.lane) lanes[j] = null; // branches that end here
+    });
+    const [first, ...rest] = r.parents;
+    lanes[r.lane] = first ?? null;
+    if (first) r.segments.push([r.lane, 0.5, r.lane, 1, r.lane]);
+    for (const p of rest) {
+      let k = lanes.indexOf(p);
+      if (k < 0) { k = free(); lanes[k] = p; }
+      r.segments.push([r.lane, 0.5, k, 1, k]);
+    }
+    width = Math.max(width, before.length, lanes.length);
+    while (lanes.length && lanes[lanes.length - 1] === null) lanes.pop();
+  }
+  for (const r of rows) r.lanes = width;
+  return rows;
+};
 
 // The same rows side by side: a run of removals pairs with the additions that follow it.
 export function splitRows(rows) {

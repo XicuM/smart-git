@@ -18,19 +18,35 @@ export function keyOf(e) {
 // Dialogs answer through module scope, which every copy of this mod shares.
 const replies = new Map();
 let asked = 0;
+// The answer comes from the dialog's own copy, and whatever the asker awaits next would run as
+// that copy, which Herdr cancels as the dialog closes (a git run there never returns). Even the
+// asker's cx.timer, called from the dialog's click, belongs to the dialog and dies with it. So
+// the asker waits on its own cx.sleep until the answer is there: tasks that ask call askFrom(cx, handle) first.
+// Herdr hands the keyboard to its first pane as a dialog closes, so the asker's `handle` takes it back.
+let hop = null;
+export function askFrom(cx, handle) { hop = { cx, handle }; }
 export function ask(spec) {
   const id = `ask-${++asked}`;
   // A menu ({ menu: true, items }) opens at the pointer, sized to its rows; { sep: true } is a line between groups.
   const size = spec.menu
     ? { kind: "popup", width: 300, height: Math.min(640, 14 + (spec.title ? 26 : 0) + spec.items.reduce((h, i) => h + (i.sep ? SEP : 30), 0)) }
     : { kind: "dialog", width: 460 };
-  return new Promise((resolve) => {
-    replies.set(id, resolve);
-    openOverlay({ mod: "smart-git", ...size, props: { view: "ask", id, ...spec } });
-  });
+  // One dialog at a time: a dialog that closed without answering (close() isn't guaranteed)
+  // would otherwise keep its action, and the sidebar's busy lock, waiting forever.
+  cancelAsks();
+  const { cx, handle } = hop ?? {}, r = { answered: false, resolve: (v) => { r.answered = true; r.value = v; } };
+  replies.set(id, r);
+  r.overlay = openOverlay({ mod: "smart-git", ...size, props: { view: "ask", id, ...spec } });
+  if (!cx) return new Promise((done) => { r.resolve = done; });
+  return (async () => { while (!r.answered) await cx.sleep(30); if (!replies.size) handle?.focus(); return r.value; })();
 }
+// Answers every open dialog with null and closes it.
+export function cancelAsks() {
+  for (const [id, r] of replies) { replies.delete(id); if (r.overlay) closeOverlay(r.overlay); r.resolve(null); }
+}
+export const asking = () => replies.size > 0;
 const SEP = 9;
-const reply = (id, value) => { replies.get(id)?.(value); replies.delete(id); };
+const reply = (id, value) => { replies.get(id)?.resolve(value); replies.delete(id); };
 // `hint` explains what the action does (shown under it), for the ones that change history.
 export const confirm = (title, detail, label, danger = true, hint) => ask({ title, detail, items: [{ key: "enter", label, value: true, danger, hint }] });
 

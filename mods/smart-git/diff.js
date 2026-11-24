@@ -1,10 +1,10 @@
 // The diff pane (lazygit's main panel): shows what the sidebar selected, unified or side by side.
 // On a file it stages, unstages or discards single lines and hunks; on a commit it moves lines
 // out of it; on a conflicted file it picks a side, conflict by conflict.
-import { div, svg } from "gpui-kit";
+import { div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { shared, theme, settings, run, setShared, exec, panes, focused } from "herdr";
-import { ask, keyOf } from "./ask.js";
+import { ask, askFrom, keyOf } from "./ask.js";
 import { perf, git, writeThere, rebaseWith, openEditor, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
 
 const ROW = 20, CHAR = 7.3;
@@ -27,6 +27,20 @@ function wrapText(text, n) {
   return out;
 }
 
+// A graph label's parts (the name, then the remotes level with it) and their widths at 11px mono.
+const labelParts = (ref) => [(ref.tone === "head" && ref.view ? "✓ " : "") + ref.name, ...(ref.remotes ?? [])]
+  .map((text) => ({ text, w: Math.ceil(8 + text.length * 6.6) }));
+// The label at x in a graph row: after the hash (10 + 8 chars), the graph, and a gap of 8 each.
+function labelAt(r, x, graphW) {
+  let left = 10 + CHAR * 8 + 8 + graphW + 8;
+  for (const ref of r.refs) {
+    const w = labelParts(ref).reduce((n, p) => n + p.w, 2);
+    if (x >= left && x < left + w) return ref;
+    left += w + 8;
+  }
+  return null;
+}
+
 // The git commands that show each kind of selection, as labelled sections.
 function sources(s, o) {
   // a/ and b/ whatever the user's config (diff.mnemonicPrefix, diff.noprefix): rows parse paths.
@@ -41,10 +55,11 @@ function sources(s, o) {
   if (s.kind === "commit") return [[null, ["show", ...flags, "--format=commit %H%d%nAuthor: %an <%ae>%nDate:   %ad (%ar)%n%n%w(0,4,4)%B", s.hash]]];
   if (s.kind === "range") return [[null, ["diff", ...flags, s.from, s.to]]];
   if (s.kind === "stash") return [[null, ["stash", "show", "-p", ...flags, "--include-untracked", s.ref]]];
-  const log = ["log", "--graph", "--no-color", "--decorate=full", `--format=${LOG_GRAPH}`, "-n", "300"];
+  // Children before parents, as the lanes need; a stash's index commit isn't history.
+  const log = ["log", "--date-order", "--no-color", "--decorate=full", `--format=${LOG_GRAPH}`, "-n", "300"];
   if (s.kind === "branch") return [[null, [...log, s.name, "--"]]];
   if (s.kind === "remote") return [[null, [...log, `--remotes=${s.name}`]]];
-  return [[null, [...log, "--all"]]];
+  return [[null, [...log, "--exclude=refs/stash", "--all"]]];
 }
 
 // A file's conflicts as rows: the plain lines, and each conflict's markers and sides (`c` its number).
@@ -129,7 +144,7 @@ export class Diff {
       if (this.loaded !== key) return;
       this.truncated = truncated; this.pending = false;
       // Rows added above (a gap opened) keep the cursor on its line while the section is the same.
-      const at = this.rows[this.cur];
+      const at = this.rows[this.cur], was = at?.kind === "L" ? at.hash : null;
       if (same && at?.raw !== undefined && texts[at.src]?.text === this.texts[at.src]?.text) {
         const n = rows.findIndex((r) => r.src === at.src && r.raw === at.raw);
         const a = this.anchor !== null ? rows.findIndex((r) => r.src === at.src && r.raw === this.rows[this.anchor]?.raw) : -1;
@@ -142,6 +157,8 @@ export class Diff {
       this.longest = rows.reduce((n, r) => Math.max(n, r.text.length), 0);
       if (!same) { this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = []; this.scroll.scroll_to_item(0); }
       if (conflict) this.ci = Math.min(this.ci, Math.max(0, conflict.filter((p) => !Array.isArray(p)).length - 1));
+      // A graph's cursor stays on its commit, or on none.
+      else if (LOGS.includes(s.kind)) this.cur = same && was ? rows.findIndex((r) => r.hash === was) : -1;
       // The cursor stays on a changed line: the nearest one at or after where it was.
       else if (!isChange(rows[this.cur])) {
         const n = rows.findIndex((r, i) => i >= Math.max(0, this.cur) && isChange(r));
@@ -172,7 +189,7 @@ export class Diff {
   step(dir) {
     if (this.hunk) return this.jump("@", dir);
     const rows = this.rows;
-    for (let i = this.cur + dir; i >= 0 && i < rows.length; i += dir) if (isChange(rows[i])) { this.cur = i; break; }
+    for (let i = this.cur + dir; i >= 0 && i < rows.length; i += dir) if (isChange(rows[i]) || rows[i].kind === "L") { this.cur = i; break; }
     this.reveal(this.cur);
   }
 
@@ -197,6 +214,7 @@ export class Diff {
     if (this.busy) return;
     this.busy = true; this.error = null; cx.notify();
     cx.spawn(async (cx) => {
+      askFrom(cx, this.handle);
       try { await work(cx); }
       catch (e) { this.error = this.failed = String(e.message ?? e); }
       finally { this.busy = false; this.loaded = null; setShared("smart-git:bump", Date.now()); cx.notify(); }
@@ -301,6 +319,14 @@ export class Diff {
     this.act(async () => { const w = await writeThere(s.repo, s.path, text); if (w.code !== 0) throw new Error(w.stderr.trim()); }, cx);
   }
 
+  // A graph row (or one of its labels) acted on with the sidebar's keys for that list ("menu": its
+  // right-click menu). The sidebar holds the key tables; the shared value says what was picked.
+  pick(view, id, key) {
+    const r = this.rows.find((x) => x.hash === id), commit = r && { hash: r.hash, short: r.short, subject: r.subject };
+    setShared("smart-git:pick", { root: this.shown?.repo?.root, view, id, key, commit, n: Date.now() });
+    run("smart-git.pick");
+  }
+
   key(k, cx) {
     const s = this.shown ?? {}, conflicts = this.conflict?.filter((p) => !Array.isArray(p)).length ?? 0;
     const toConflict = (n) => {
@@ -308,46 +334,51 @@ export class Diff {
       const first = this.rows.findIndex((r) => r.c === this.ci);
       if (first >= 0) this.reveal(first);
     };
+    // A labelled key ([label, fn]) is also in the ? list; a bare fn is an alias.
     const keys = this.conflict ? {
-      j: () => toConflict(this.ci + 1), down: () => toConflict(this.ci + 1), k: () => toConflict(this.ci - 1), up: () => toConflict(this.ci - 1),
-      h: () => { this.side = "ours"; }, left: () => { this.side = "ours"; }, l: () => { this.side = "theirs"; }, right: () => { this.side = "theirs"; },
-      space: () => this.resolve(this.side, cx), enter: () => this.resolve(this.side, cx), b: () => this.resolve("both", cx), z: () => this.undoResolve(cx),
+      j: ["Next conflict", () => toConflict(this.ci + 1)], down: () => toConflict(this.ci + 1), k: ["Previous conflict", () => toConflict(this.ci - 1)], up: () => toConflict(this.ci - 1),
+      h: ["Pick ours", () => { this.side = "ours"; }], left: () => { this.side = "ours"; }, l: ["Pick theirs", () => { this.side = "theirs"; }], right: () => { this.side = "theirs"; },
+      space: ["Resolve with the picked side", () => this.resolve(this.side, cx)], enter: () => this.resolve(this.side, cx), b: ["Keep both", () => this.resolve("both", cx)], z: ["Undo resolve", () => this.undoResolve(cx)],
     } : {
-      j: () => this.step(1), down: () => this.step(1), k: () => this.step(-1), up: () => this.step(-1),
-      g: () => { this.cur = -1; this.step(1); }, G: () => { this.cur = this.rows.length; this.step(-1); },
-      v: () => { this.anchor = this.anchor === null ? this.cur : null; this.hunk = false; },
-      a: () => { this.hunk = !this.hunk; this.anchor = null; },
-      ...(s.kind === "file" ? { space: () => this.stageLines(cx), d: () => this.discardLines(cx), e: () => this.editAt(cx) } : {}),
-      ...(s.kind === "commit" ? { space: () => this.commitPatch(cx), "ctrl-p": () => this.commitPatch(cx) } : {}),
+      j: ["Next line", () => this.step(1)], down: () => this.step(1), k: ["Previous line", () => this.step(-1)], up: () => this.step(-1),
+      g: ["First line", () => { this.cur = -1; this.step(1); }], G: ["Last line", () => { this.cur = this.rows.length; this.step(-1); }],
+      v: ["Select lines", () => { this.anchor = this.anchor === null ? this.cur : null; this.hunk = false; }],
+      a: ["Hunk mode", () => { this.hunk = !this.hunk; this.anchor = null; }],
+      ...(s.kind === "file" ? { space: ["Stage lines", () => this.stageLines(cx)], d: ["Discard lines", () => this.discardLines(cx)], e: ["Edit file here", () => this.editAt(cx)] } : {}),
+      ...(s.kind === "commit" ? { space: ["Move lines out of the commit", () => this.commitPatch(cx)] } : {}),
       // Lazygit's hunk keys; files have none there, so J/K (its keys to scroll this panel).
-      h: () => this.jump("@", -1), left: () => this.jump("@", -1), l: () => this.jump("@", 1), right: () => this.jump("@", 1),
-      K: () => this.jump("f", -1), J: () => this.jump("f", 1),
+      h: ["Previous hunk", () => this.jump("@", -1)], left: () => this.jump("@", -1), l: ["Next hunk", () => this.jump("@", 1)], right: () => this.jump("@", 1),
+      K: ["Previous file", () => this.jump("f", -1)], J: ["Next file", () => this.jump("f", 1)],
     };
     const common = {
-      s: () => this.setLayout({ auto: "split", split: "unified", unified: "auto" }[this.layout]), w: () => this.toggle("wrap"), "ctrl-w": () => this.toggle("ws"), f: () => this.toggle("full"),
-      S: () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("smart-git:sub", this.sub); },
-      "{": () => { this.context = Math.max(0, this.context - 1); setShared("smart-git:context", this.context); },
-      "}": () => { this.context++; setShared("smart-git:context", this.context); },
-      z: () => this.zoom(),
+      s: ["Change layout", () => this.setLayout({ auto: "split", split: "unified", unified: "auto" }[this.layout])], w: ["Wrap lines", () => this.toggle("wrap")],
+      "ctrl-w": ["Ignore whitespace", () => this.toggle("ws")], f: ["Whole file", () => this.toggle("full")],
+      S: ["Toggle submodule diff", () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("smart-git:sub", this.sub); }],
+      "{": ["Less context", () => { this.context = Math.max(0, this.context - 1); setShared("smart-git:context", this.context); }],
+      "}": ["More context", () => { this.context++; setShared("smart-git:context", this.context); }],
+      z: ["Zoom", () => this.zoom()],
       // Side by side, unwrapped: both halves sideways, as lazygit's H/L.
-      H: () => { this.dx -= 8 * CHAR; }, L: () => { this.dx += 8 * CHAR; },
+      H: ["Scroll left", () => { this.dx -= 8 * CHAR; }], L: ["Scroll right", () => { this.dx += 8 * CHAR; }],
       escape: () => { if (this.anchor !== null || this.hunk) { this.anchor = null; this.hunk = false; } else this.back(); },
-      q: () => this.back(),
+      q: ["Back", () => this.back()],
       // 1–5 jump to that sidebar section, as from the sidebar; the diff stays zoomed.
-      ...Object.fromEntries([1, 2, 3, 4, 5].map((n) => [String(n), () => run(`smart-git.sidebar:${n}`)])),
+      ...Object.fromEntries(["Status", "Files", "Branches", "Commits", "Stash"].map((name, n) => [String(n + 1), [`Sidebar: ${name}`, () => run(`smart-git.sidebar:${n + 1}`)]])),
       // The sidebar's ? lists every key; here, the diff's. Picking one runs it.
       "?": () => cx.spawn(async (cx) => {
-        const keys = [["j", "Next line"], ["k", "Previous line"], ["g", "First line"], ["G", "Last line"], ["v", "Select lines"], ["a", "Hunk mode"],
-          ["space", "Stage lines (file)"], ["d", "Discard lines (file)"], ["e", "Edit file (file)"], ["h", "Previous hunk"], ["l", "Next hunk"],
-          ["K", "Previous file"], ["J", "Next file"], ["s", "Change layout"], ["w", "Wrap lines"], ["ctrl-w", "Ignore whitespace"], ["f", "Whole file"],
-          ["S", "Toggle submodule diff"], ["{", "Less context"], ["}", "More context"], ["z", "Zoom"], ["H", "Scroll left"], ["L", "Scroll right"], ["q", "Back"], ["1", "Sidebar: Status"], ["2", "Sidebar: Files"], ["3", "Sidebar: Branches"], ["4", "Sidebar: Commits"], ["5", "Sidebar: Stash"]];
-        const k = await ask({ title: "Keys", items: keys.map(([value, label]) => ({ key: "", label: `${value}  ${label}`, value })) });
+        askFrom(cx, this.handle);
+        const items = [...Object.entries(keys), ...Object.entries(common).filter(([k]) => !(k in keys))].filter(([, a]) => Array.isArray(a)).map(([value, [label]]) => ({ key: "", label: `${value}  ${label}`, value }));
+        const k = await ask({ title: "Keys", items });
         if (k) { this.key(k, cx); cx.notify(); }
       }),
     };
+    // On a graph, the keys that aren't the pane's own go to the selected commit, as in Commits.
+    if (this.isLog()) {
+      const own = ["j", "k", "down", "up", "w", "z", "escape", "q", "1", "2", "3", "4", "5"];
+      if (!own.includes(k)) { const r = this.rows[this.cur]; if (!r?.hash) return false; this.pick("commits", r.hash, k === "x" || k === "?" ? "menu" : k); return true; }
+    }
     const a = keys[k] ?? common[k];
     if (!a) return false;
-    a();
+    (Array.isArray(a) ? a[1] : a)();
     cx.notify();
     return true;
   }
@@ -378,6 +409,25 @@ export class Diff {
 
   // The rows as drawn: wrapped to the pane's width (each piece its own row, so every row
   // keeps the list's one height), or as they are, for scrolling sideways.
+  // The graph column: a lane each, at most 40% of the pane.
+  graphW() { return Math.min(12 + (this.rows[0]?.lanes ?? 1) * 12, Math.max(60, this.width * 0.4)); }
+  // A graph row's labels, wrapped: the first row keeps room for the subject, author and date
+  // columns; the labels that don't fit go on rows below it, the lanes running straight through.
+  logPieces(r) {
+    const left = 10 + CHAR * 8 + 8 + this.graphW() + 8, wide = (ref) => labelParts(ref).reduce((n, p) => n + p.w, 2) + 8;
+    const out = [];
+    let refs = [], room = this.width - left - (CHAR * 16 + 8) - (CHAR * 14 + 8) - CHAR * 10 - 10;
+    for (const ref of r.refs) {
+      if (refs.length && wide(ref) > room) {
+        out.push(out.length ? { ...r, refs, cont: true } : { ...r, refs });
+        refs = []; room = this.width - left - 10;
+      }
+      refs.push(ref); room -= wide(ref);
+    }
+    out.push(out.length ? { ...r, refs, cont: true } : { ...r, refs });
+    return out;
+  }
+
   visual() {
     const split = this.sideBySide();
     const pairs = split ? (this.pairs ??= splitRows(this.rows)) : null;
@@ -398,7 +448,7 @@ export class Diff {
     if (!pairs) {
       const n = Math.floor((this.width - 110) / CHAR);
       for (const r of this.rows) {
-        if (r.kind === "L") { out.push(r); continue; }
+        if (r.kind === "L") { out.push(...this.logPieces(r)); continue; }
         out.push(...pieces(r, BANDS.includes(r.kind) ? full : n));
       }
     } else {
@@ -422,7 +472,7 @@ export class Diff {
     if (s?.kind === "file") return `${pick} · space stage · d discard · e edit · f full file · z zoom · {/} context · esc back`;
     if (s?.kind === "commit") return `${pick} · space move out of commit · f full file · z zoom · esc back`;
     if (s?.kind === "range" || s?.kind === "stash") return "j/k line · ←/→ hunk · J/K file · s layout · f full file · w wrap · z zoom · {/} context · esc back";
-    if (this.isLog()) return "w wrap · z zoom · esc back";
+    if (this.isLog()) return "j/k commit · x or right-click menu · Commits' keys act on it · double-click a label checks it out · z zoom · esc back";
     return "s layout · f full file · w wrap · z zoom · {/} context · esc back";
   }
 
@@ -467,15 +517,45 @@ export class Diff {
     const lanes = [t.ansi4, t.ansi5, t.ansi6, t.ansi2, t.ansi3, t.ansi1];
     const refColor = { head: t.ansi6, local: t.ansi2, remote: t.ansi1, tag: t.ansi3, other: t.dim };
     const authorColor = (name) => lanes[[...name].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7) % lanes.length];
-    const glyph = { "*": "●", "|": "│" };
-    // The hash first, in a fixed column, so it lines up however wide the graph is.
-    const logLine = (r) => h_flex().h(ROW).flex_none().w_full().px(10).gap(8).whitespace_nowrap()
-      .child(div().w(CHAR * 9).flex_none().text_color(t.ansi3).child(r.hash))
-      .child(h_flex().flex_none().children([...r.graph].map((ch, i) => div().w(CHAR).flex_none().text_color(lanes[Math.floor(i / 2) % lanes.length]).child(glyph[ch] ?? ch))))
-      .when(Boolean(r.hash), (e) => e
-        .children(r.refs.map((ref) => div().flex_none().font_semibold().text_color(refColor[ref.tone]).child(ref.name)))
-        .child(div().flex_1().min_w(0).truncate().child(r.subject))
-        .child(div().flex_none().text_color(authorColor(r.author)).child(r.author))
+    // The graph: a lane per branch, each its own color top to bottom, curves where branches fork and
+    // merge (one stroked path per color a row). HEAD is a ring, other commits a dot.
+    const LANE = 12, graphW = this.graphW();
+    const laneX = (n) => 6 + n * LANE + LANE / 2;
+    const graph = (r) => {
+      const paths = new Map();
+      // A wrapped row's continuation: only the lanes leaving the bottom, straight down.
+      const segments = r.cont ? r.segments.filter((g) => g[3] === 1).map(([, , b, , c]) => [b, 0, b, 1, c]) : r.segments;
+      for (const [a, ya, b, yb, c] of segments) {
+        const color = lanes[c % lanes.length];
+        let p = (paths.get(color) ?? PathBuilder.stroke(1.5)).move_to(laneX(a), ya * ROW);
+        if (a === b) p = p.line_to(laneX(b), yb * ROW);
+        else { const mid = (ya + yb) / 2 * ROW; p = p.cubic_bezier_to(laneX(b), yb * ROW, laneX(a), mid, laneX(b), mid); }
+        paths.set(color, p);
+      }
+      const color = lanes[r.lane % lanes.length], dot = div().absolute().left(laneX(r.lane) - 4).top(ROW / 2 - 4).size(8).rounded(4);
+      return div().relative().flex_none().w(graphW).h(ROW).overflow_hidden()
+        .children([...paths].map(([c, p]) => window.paint_path(p.build(), c).absolute().top(0).left(0).size_full()))
+        .when(!r.cont, (e) => e.child(r.head ? dot.bg(t.background).border(2).border_color(color) : dot.bg(color)));
+    };
+    // A label: the checked out branch filled with a ✓, a local branch with the remotes level with it
+    // (`main | origin`). Parts have set widths, so a click's x says which label it hit (labelAt).
+    const label = (ref) => {
+      const edge = refColor[ref.tone], filled = ref.tone === "head", [main, ...rest] = labelParts(ref);
+      return h_flex().flex_none().h(16).rounded(4).border_1().border_color(edge).overflow_hidden().text_size(11).when(filled, (e) => e.bg(edge))
+        .child(div().w(main.w).flex_none().px(4).font_semibold().text_color(filled ? t.background : edge).child(main.text))
+        .children(rest.map((p) => div().w(p.w).flex_none().px(4).h_full().border_l(1).border_color(edge).bg(filled ? t.background + "33" : edge + "1f")
+          .text_color(filled ? t.background : t.muted).child(p.text)));
+    };
+    // The hash first, in a fixed column, so it lines up however wide the graph is. HEAD's row is
+    // tinted with its lane's color; merges are dim.
+    const logLine = (r, v) => h_flex().id(`v-${v}`).h(ROW).flex_none().w_full().pr(10).gap(8).items_center().whitespace_nowrap()
+      .when(r.head, (e) => e.bg(lanes[r.lane % lanes.length] + "1a")).when(r.i === this.cur, (e) => e.bg(focused ? t.selection : t.hover))
+      .child(div().w(CHAR * 8).ml(10).flex_none().text_color(t.ansi3).child(r.cont ? "" : r.short))
+      .child(graph(r))
+      .children(r.refs.map(label))
+      .when(!r.cont, (e) => e
+        .child(div().flex_1().min_w(0).truncate().when(r.head, (e) => e.font_semibold()).when(r.parents.length > 1, (e) => e.text_color(t.dim)).child(r.subject))
+        .child(div().w(CHAR * 14).flex_none().truncate().text_color(authorColor(r.author)).child(r.author))
         .child(div().w(CHAR * 10).flex_none().text_right().text_color(t.dim).child(r.when.replace(/, \d+ months?/, "").replace(/ ago$/, ""))));
     // A commit's header: labels dim, hash and refs in color, the message in full ink.
     const header = (r) => {
@@ -486,7 +566,7 @@ export class Diff {
       if (m) return row.child(div().text_color(t.dim).child(m[1])).child(div().child(m[2]));
       return row.when(Boolean(r.title), (e) => e.font_semibold()).child(r.text);
     };
-    const band = (r) => {
+    const band = (r, v) => {
       if (r.kind === "s") return div().px(10).h(ROW).flex_none().bg(t.raised).text_color(t.accent).font_semibold().child(r.text);
       if (r.kind === "f") return h_flex().px(10).gap(10).h(ROW).flex_none().bg(t.raised).whitespace_nowrap()
         .child(div().flex_none().text_color(t.foreground).font_semibold().child(r.text))
@@ -497,7 +577,7 @@ export class Diff {
         .child(div().text_color(t.muted).child(r.text));
       if (r.kind === "g") return div().px(10).h(ROW).flex_none().bg(t.surface).text_color(t.accent).cursor_pointer().whitespace_nowrap().child(r.text);
       if (r.kind === "h") return header(r);
-      if (r.kind === "L") return logLine(r);
+      if (r.kind === "L") return logLine(r, v);
       if (["<", "|", "=", ">"].includes(r.kind)) return h_flex().h(ROW).flex_none().text_color(r.c === this.ci ? t.blocked : t.dim).child(num(r.new)).child(div().w(14).flex_none()).child(div().whitespace_nowrap().child(r.text));
       return null;
     };
@@ -509,7 +589,7 @@ export class Diff {
         .child(div().flex_none().rounded(2).bg(strong(r)).child(r.text.slice(a, b)))
         .child(div().flex_none().child(r.text.slice(b)));
     };
-    const unified = (r, v) => band(r) ?? h_flex().id(`v-${v}`).h(ROW).flex_none().w_full().when(Boolean(bg(r)), (e) => e.bg(bg(r)))
+    const unified = (r, v) => band(r, v) ?? h_flex().id(`v-${v}`).h(ROW).flex_none().w_full().when(Boolean(bg(r)), (e) => e.bg(bg(r)))
       .child(num(r.old, r)).child(num(r.new, r))
       .child(div().w(14).flex_none().h_full().when(Boolean(strong(r)), (e) => e.bg(strong(r))).child(isChange(r) ? r.kind : ""))
       .child(div().w(6).flex_none())
@@ -551,7 +631,7 @@ export class Diff {
         .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))
           // Where a press lands says which side of a row was clicked: the list only names the row.
-          .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); })
+          .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); this.clicks = e.click_count; })
             .child(v_virtual_list("smart-git-rows", rows.length, ROW, (i) => String(i),
             (range) => rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k))).track_scroll(this.scroll).size_full()
             .on_item_click((key, cx) => {
@@ -559,8 +639,20 @@ export class Diff {
               this.handle.focus();
               if (r?.kind === "g" && r.gap) { this.open.add(r.gap); this.loaded = null; }
               if (r?.kind === "@") { const n = this.rows.findIndex((x, j) => j > r.i && isChange(x)); if (n >= 0) { this.cur = n; this.hunk = true; this.anchor = null; } }
-              if (r && isChange(this.rows[r.i])) this.cur = r.i;
+              if (r && (isChange(this.rows[r.i]) || r.kind === "L")) this.cur = r.i;
               if (r?.side) { this.ci = r.c; this.side = r.side; }
+              // A double-click on a branch or tag label checks it out, as Space does in its list.
+              const hit = r?.kind === "L" && this.clicks >= 2 ? labelAt(r, this.downX, graphW) : null;
+              if (hit?.view) this.pick(hit.view, hit.name, "space");
+              cx.notify();
+            })
+            // Right-click: the menu of the label under the pointer, or of the commit.
+            .on_item_secondary_click((key, e, cx) => {
+              const r = rows[Number(key)];
+              if (r?.kind !== "L") return;
+              this.cur = r.i; this.handle.focus();
+              const hit = labelAt(r, (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1), graphW);
+              if (hit?.view) this.pick(hit.view, hit.name, "menu"); else this.pick("commits", r.hash, "menu");
               cx.notify();
             }))))
         .child(Scrollbar.vertical("smart-git-rows").viewport_from_layout().absolute().inset_0())
