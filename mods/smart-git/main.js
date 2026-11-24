@@ -1413,6 +1413,11 @@ class Sidebar {
         }))
         .child(div().id(`fold-${p.id}`).flex_1().min_w(0).h_full().flex().items_center().gap(6).cursor_pointer().on_click((_e, cx) => toggle(p.id, cx))
           .child(div().flex_1().min_w(0).truncate().font_normal().text_size(11).text_color(t.dim).child(open ? "" : this.summary(view)))
+          // The tree/flat toggle shows the view a click switches to.
+          .when(view === "files", (e) => e.child(div().id("tree-toggle").flex_none().size(20).flex().items_center().justify_center().rounded(4).cursor_pointer().text_color(t.dim).hover((s) => s.text_color(t.foreground))
+            .tooltip(this.tree ? "Show as a flat list (`)" : "Show as a tree (`)")
+            .on_click((_e, cx) => { cx.stop_propagation(); this.handle.focus(); this.panel = "files"; this.key("`", cx); })
+            .child(svg(`mods/smart-git/${this.tree ? "list" : "list-tree"}.svg`).size(13))))
           .child(div().flex_none().text_size(10.5).text_color(active && focused ? t.accent : t.dim).child(String(n)))
           .child(icon(open ? "chevron-down" : "chevron-right").size(11).flex_none().text_color(t.dim)));
       const el = v_flex().when(n > 2, (e) => e.border_t(1).border_color(t.border)).child(header);
