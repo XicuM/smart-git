@@ -766,6 +766,8 @@ class Sidebar {
       { key: "m", label: "Mixed: keep changes unstaged", value: "--mixed", hint: "The changes of the commits left behind stay in your files, unstaged. Nothing is lost." },
       { key: "h", label: "Hard: discard all changes", value: "--hard", danger: true, hint: "Your files become exactly this commit: the commits' changes and any uncommitted work are thrown away. Uncommitted work can't be recovered." },
     ] });
+    // lazygit's warnings, word for word: a hard reset over uncommitted work.
+    if (r === "--hard" && this.files.some((f) => !f.sub) && !await confirm("Hard reset", "Are you sure you want to do a hard reset? This will discard all uncommitted changes (both staged and unstaged), which is not undoable.", "Hard reset")) return;
     if (r) await this.w(["reset", r, "-q", hash]);
   }
 
@@ -871,6 +873,9 @@ class Sidebar {
               { key: "h", label: `Hard reset to ${up}`, value: "--hard", danger: true },
             ] : []),
           ] });
+          // lazygit's warnings, word for word: nuking always, a hard reset over uncommitted work.
+          if (r === "nuke" && !await confirm("Nuke working tree", "Are you sure you want to nuke the working tree? This will discard all changes in the worktree (staged, unstaged and untracked), which is not undoable.", "Nuke working tree")) return;
+          if (r === "--hard" && this.files.some((f) => !f.sub) && !await confirm("Hard reset", "Are you sure you want to do a hard reset? This will discard all uncommitted changes (both staged and unstaged), which is not undoable.", "Hard reset")) return;
           if (r === "nuke") { await this.w(["reset", "--hard", "-q"]); await this.w(["clean", "-fd"]); }
           else if (r === "unstaged") await this.w(["checkout", "--", "."]);
           else if (r === "untracked") await this.w(["clean", "-fd"]);
@@ -1087,6 +1092,7 @@ class Sidebar {
             ...this.remotes.map((rm, n) => ({ key: String(n + 1), label: `Delete locally and on ${rm.name}`, value: rm.name, danger: true })),
           ] });
           if (!r) return;
+          if (r !== "local" && !await confirm(`Delete tag '${row.id}'?`, `Are you sure you want to delete '${row.id}' from both your machine and from '${r}'?`, "Delete")) return;
           if (r !== "local") await this.remote(["push", r, "--delete", `refs/tags/${row.id}`]);
           await this.w(["tag", "-d", row.id]);
         })],
@@ -1184,6 +1190,7 @@ class Sidebar {
             ...(on ? [{ key: "s", label: `Skip ${short}`, value: "skip" }, { key: "r", label: "Stop bisecting (reset)", value: "reset", danger: true }] : []),
           ] });
           if (!r) return;
+          if (r === "reset" && !await confirm("Reset bisect", "Are you sure you want to reset 'git bisect'? The good and bad marks so far are lost.", "Reset")) return;
           if (!on) await this.w(["bisect", "start"]);
           const out = await this.w(r === "reset" ? ["bisect", "reset"] : ["bisect", r, row.id]);
           this.info = out.split("\n").find((l) => /first bad commit|^Bisecting:/.test(l)) ?? null;
