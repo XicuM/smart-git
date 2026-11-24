@@ -70,7 +70,7 @@ function conflictRows(parts) {
     if (Array.isArray(p)) { for (const text of p) rows.push({ kind: " ", new: line++, text }); continue; }
     rows.push({ kind: "<", text: p.head, c, new: line++ });
     for (const text of p.ours) rows.push({ kind: "o", side: "ours", text, c, new: line++ });
-    if (p.base) { rows.push({ kind: "|", text: p.mid, c, new: line++ }); for (const text of p.base) rows.push({ kind: "b", text, c, new: line++ }); }
+    if (p.base) { rows.push({ kind: "|", text: p.mid, c, new: line++ }); for (const text of p.base) rows.push({ kind: "b", side: "base", text, c, new: line++ }); }
     rows.push({ kind: "=", text: "=======", c, new: line++ });
     for (const text of p.theirs) rows.push({ kind: "t", side: "theirs", text, c, new: line++ });
     rows.push({ kind: ">", text: p.tail, c, new: line++ });
@@ -114,7 +114,8 @@ export class Diff {
         return text.split("\n");
       };
       try {
-        if (s.kind === "conflict") {
+        if (s.kind === "conflict" && s.none) conflict = [[]];
+        else if (s.kind === "conflict") {
           const r = await exec("cat", ["--", s.path], { cwd: s.repo.root, on: s.repo.on });
           if (r.code !== 0) throw new Error(r.stderr.trim());
           conflict = parseConflicts(r.stdout);
@@ -156,7 +157,11 @@ export class Diff {
       this.rows = rows; this.texts = texts; this.conflict = conflict; this.pairs = null; this.vis = null;
       this.longest = rows.reduce((n, r) => Math.max(n, r.text.length), 0);
       if (!same) { this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = []; this.scroll.scroll_to_item(0); }
-      if (conflict) this.ci = Math.min(this.ci, Math.max(0, conflict.filter((p) => !Array.isArray(p)).length - 1));
+      if (conflict) {
+        const cs = conflict.filter((p) => !Array.isArray(p));
+        this.ci = Math.min(this.ci, Math.max(0, cs.length - 1));
+        if (this.side === "base" && !cs[this.ci]?.base) this.side = "ours";
+      }
       // A graph's cursor stays on its commit, or on none.
       else if (LOGS.includes(s.kind)) this.cur = same && was ? rows.findIndex((r) => r.hash === was) : -1;
       // The cursor stays on a changed line: the nearest one at or after where it was.
@@ -307,9 +312,9 @@ export class Diff {
       parts[parts.indexOf(c)] = how === "both" ? [...c.ours, ...c.theirs] : c[how];
       const w = await writeThere(s.repo, s.path, conflictText(parts));
       if (w.code !== 0) throw new Error(w.stderr.trim());
+      // The last one picked: staged, as lazygit does.
       if (conflicts.length > 1) return;
-      if (await ask({ title: "All conflicts resolved", detail: `Stage ${s.path}?`, items: [{ key: "enter", label: "Stage it", value: true }] }))
-        await git(s.repo, ["add", "--", s.path], { write: true });
+      await git(s.repo, ["add", "--", s.path], { write: true });
     }, cx);
   }
 
@@ -328,16 +333,21 @@ export class Diff {
   }
 
   key(k, cx) {
-    const s = this.shown ?? {}, conflicts = this.conflict?.filter((p) => !Array.isArray(p)).length ?? 0;
+    const s = this.shown ?? {}, cs = this.conflict?.filter((p) => !Array.isArray(p)) ?? [], conflicts = cs.length;
     const toConflict = (n) => {
-      this.ci = Math.max(0, Math.min(n, conflicts - 1));
+      this.ci = Math.max(0, Math.min(n, conflicts - 1)); sideBy(0);
       const first = this.rows.findIndex((r) => r.c === this.ci);
       if (first >= 0) this.reveal(first);
+    };
+    // ours, base (when the file has diff3 markers), theirs: h/l step through the selected conflict's.
+    const sideBy = (d) => {
+      const sides = cs[this.ci]?.base ? ["ours", "base", "theirs"] : ["ours", "theirs"];
+      this.side = sides[Math.max(0, Math.min(sides.length - 1, sides.indexOf(this.side) + d))];
     };
     // A labelled key ([label, fn]) is also in the ? list; a bare fn is an alias.
     const keys = this.conflict ? {
       j: ["Next conflict", () => toConflict(this.ci + 1)], down: () => toConflict(this.ci + 1), k: ["Previous conflict", () => toConflict(this.ci - 1)], up: () => toConflict(this.ci - 1),
-      h: ["Pick ours", () => { this.side = "ours"; }], left: () => { this.side = "ours"; }, l: ["Pick theirs", () => { this.side = "theirs"; }], right: () => { this.side = "theirs"; },
+      h: ["Side above (ours, base)", () => sideBy(-1)], left: () => sideBy(-1), l: ["Side below (base, theirs)", () => sideBy(1)], right: () => sideBy(1),
       space: ["Resolve with the picked side", () => this.resolve(this.side, cx)], enter: () => this.resolve(this.side, cx), b: ["Keep both", () => this.resolve("both", cx)], z: ["Undo resolve", () => this.undoResolve(cx)],
     } : {
       j: ["Next line", () => this.step(1)], down: () => this.step(1), k: ["Previous line", () => this.step(-1)], up: () => this.step(-1),
@@ -467,7 +477,7 @@ export class Diff {
 
   hints() {
     const s = this.shown;
-    if (this.conflict) return "j/k conflict · h/l side · space pick · b both · z undo the last pick · esc back";
+    if (this.conflict) return "j/k conflict · h/l side (ours, base, theirs) · space pick · b both · z undo the last pick · esc back";
     const pick = "j/k line · ←/→ hunk · J/K file · v range · a hunk";
     if (s?.kind === "file") return `${pick} · space stage · d discard · e edit · f full file · z zoom · {/} context · esc back`;
     if (s?.kind === "commit") return `${pick} · space move out of commit · f full file · z zoom · esc back`;
@@ -510,8 +520,8 @@ export class Diff {
       .child(n === undefined ? "" : String(n));
     const bg = (r) => {
       if (picked.has(r.i)) return t.selection;
-      if (r.side) return r.c === this.ci && r.side === this.side && focused ? t.selection : (r.side === "ours" ? t.ansi2 : t.ansi4) + "22";
-      return r.kind === "+" ? t.ansi2 + "22" : r.kind === "-" ? t.ansi1 + "22" : r.kind === "b" ? t.surface : null;
+      if (r.side) return r.c === this.ci && r.side === this.side && focused ? t.selection : r.side === "base" ? t.surface : (r.side === "ours" ? t.ansi2 : t.ansi4) + "22";
+      return r.kind === "+" ? t.ansi2 + "22" : r.kind === "-" ? t.ansi1 + "22" : null;
     };
     // Lazygit's colors: lanes cycle, refs by kind (git's own), an author keeps one color.
     const lanes = [t.ansi4, t.ansi5, t.ansi6, t.ansi2, t.ansi3, t.ansi1];
@@ -626,7 +636,7 @@ export class Diff {
       .when(Boolean(this.error), (e) => e.child(div().id("error").p(10).text_color(t.ansi1).cursor_pointer().on_click((_e, cx) => { this.error = null; cx.notify(); }).child(this.error)))
       .when(!this.pending && !this.error && !this.conflict && !this.rows.length && Boolean(this.shown), (e) => e.child(div().p(10).text_color(t.muted)
         .child(this.ws ? "Nothing to show: only whitespace changed (ctrl-w shows it)" : "Nothing to show here")))
-      .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child("No conflict markers left. M in the files list keeps one side of the whole file.")))
+      .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child(this.shown?.note ?? "No conflict markers left. M in the files list keeps one side of the whole file.")))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
         .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))

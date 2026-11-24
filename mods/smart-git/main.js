@@ -269,7 +269,7 @@ class Sidebar {
         const raw = [status, branches, log, stash, subs, subConfig, worktrees, remotes, remoteBranches, tags, reflog, state].join("\0\x1e");
         if (raw === this.raw && !this.error) { same = true; return; }
         this.raw = raw;
-        const s = parseStatus(status);
+        const s = parseStatus(status), before = this.files.filter((f) => f.conflict).length;
         this.head = s.head; this.files = s.files; this.branches = parseBranches(branches);
         this.commits = parseLog(log); this.stash = parseStash(stash); if (subs !== null) this.submodules = parseSubmodules(subs, subConfig);
         this.worktrees = parseWorktrees(worktrees); this.remotes = parseRemotes(remotes); this.remoteBranches = parseRefs(remoteBranches);
@@ -282,6 +282,10 @@ class Sidebar {
         let h = 0;
         for (let i = 0; i < status.length; i++) h = (h * 31 + status.charCodeAt(i)) | 0;
         this.stamp = h; this.error = null;
+        // Conflicts where there were none after a command here failed, and the last of them resolved, each ask what next.
+        const left = this.files.filter((f) => f.conflict).length, op = this.ops.find((o) => o !== "BISECT_LOG");
+        if (!before && left && Date.now() - (this.failedAt ?? 0) < 60000) { this.failedAt = 0; this.act("…", (cx) => this.opMenu(op, { title: `${left} conflicted file${left > 1 ? "s" : ""}`, view: true }, cx), cx); }
+        else if (before && !left && op) this.act("…", (cx) => this.opMenu(op, { title: "All conflicts resolved" }, cx), cx);
       } catch (e) { if (repo === this.repo) this.error = String(e.message ?? e); }
       finally { this.loading = 0; if (this.again) this.refresh(cx); if (!same) { this.show(cx); cx.notify(); } }
     });
@@ -358,7 +362,12 @@ class Sidebar {
     const files = row.file ? [row.file] : row.files, ref = this.refOf(row);
     const short = (r) => /^[0-9a-f]{40}$/.test(r) ? r.slice(0, 7) : r;
     let s;
-    if (row.file?.conflict) s = { kind: "conflict", path: row.file.path, title: `Conflicts in ${row.file.path}` };
+    if (row.file?.conflict) {
+      const f = row.file, note = f.sub ? "Both sides moved this submodule to different commits."
+        : !f.ours && !f.theirs ? "Both sides deleted this file." : !f.ours ? "We deleted this file; they changed it." : !f.theirs ? "They deleted this file; we changed it." : null;
+      // A submodule is a folder and a file both sides deleted is gone: nothing to read.
+      s = { kind: "conflict", path: f.path, title: `Conflicts in ${f.path}`, note: note && `${note} enter in the files list keeps one side.`, none: Boolean(f.sub || (!f.ours && !f.theirs)) };
+    }
     else if (files) s = { kind: "file", path: row.file?.path ?? row.dir, untracked: row.file?.untracked, staged: files.some((f) => f.staged), unstaged: files.some((f) => f.unstaged), title: row.file?.path ?? row.dir + "/" };
     else if (this.diffBase && ref) s = { kind: "range", from: this.diffBase, to: ref, title: `${short(this.diffBase)} → ${short(ref)}` };
     else if (row.commit || row.reflog || (row.todo && ref)) {
@@ -430,7 +439,11 @@ class Sidebar {
     cx.spawn(async (cx) => {
       askFrom(cx, this.handle);
       try { await work(cx); }
-      catch (e) { this.note = String(e.message ?? e); }
+      catch (e) {
+        this.note = String(e.message ?? e);
+        // git may have stopped at conflicts (a merge, rebase, pull, cherry-pick, stash pop): the refresh sees.
+        this.failedAt = Date.now();
+      }
       finally { if (this.acts === n) this.busy = null; this.refresh(cx); cx.notify(); }
     });
   }
@@ -646,6 +659,50 @@ class Sidebar {
     await this.w(["submodule", "update", "--init", "--force", "--recursive", "--", path], { timeout: 300000 });
   }
 
+  // A conflicted file kept whole from one side. A side that deleted it is kept with `git rm`; a
+  // submodule records that side's commit (checkout --ours/--theirs does nothing to one) and moves to it.
+  async resolveFile(f) {
+    const p = f.path, sub = { root: `${this.repo.root}/${p}`, on: this.repo.on };
+    const what = async (sha) => !sha ? "deleted" : f.sub ? (await git(sub, ["log", "-1", "--format=%h %s", sha]).catch(() => sha.slice(0, 7))).trim() : null;
+    const [ours, theirs] = await Promise.all([what(f.ours), what(f.theirs)]);
+    const r = await ask({ title: `Resolve ${p}`, detail: f.whole ? null : "enter on the file picks conflict by conflict in the diff pane.", items: [
+      { key: "o", label: `Keep ours (the checked out side)${ours ? `: ${ours}` : ""}`, value: "ours" },
+      { key: "t", label: `Keep theirs (the incoming side)${theirs ? `: ${theirs}` : ""}`, value: "theirs" },
+      ...(f.sub ? [{ key: "c", label: "Keep the commit checked out in the submodule (merge in it first)", value: "checked" }]
+        : [{ key: "m", label: "Open git mergetool in a terminal", value: "tool" }]),
+    ] });
+    if (!r) return;
+    if (r === "tool") return this.inTerminal(["git", "mergetool", "--", p]);
+    if (r === "checked") return this.w(["add", "--", p]);
+    const sha = f[r];
+    if (!sha) return this.w(["rm", "-q", "--", p]);
+    if (!f.sub) { await this.w(["checkout", `--${r}`, "--", p]); return this.w(["add", "--", p]); }
+    await this.w(["update-index", "--cacheinfo", `160000,${sha},${p}`]);
+    await this.w(["submodule", "update", "--", p], { timeout: 300000 });
+  }
+
+  // What to do with a merge, rebase, cherry-pick or revert (`op`, its file in .git), as lazygit asks:
+  // on m, when a command here just left conflicts (`view`: show them, or abort), and when the last is resolved.
+  async opMenu(op, { title = OPS[op], view = false } = {}, cx) {
+    const cmd = !op ? null : op.startsWith("rebase") ? "rebase" : op === "MERGE_HEAD" ? "merge" : op === "CHERRY_PICK_HEAD" ? "cherry-pick" : "revert";
+    const r = await ask({ title, detail: !view && this.files.some((f) => f.conflict) ? "There are still conflicts." : null, items: [
+      ...(view ? [{ key: "v", label: "View conflicts", value: "view" }] : [{ key: "c", label: "Continue", value: "--continue" }]),
+      ...(cmd ? [{ key: "a", label: `Abort the ${cmd}`, value: "--abort", danger: true }] : []),
+      ...(cmd && !view && cmd !== "merge" ? [{ key: "s", label: "Skip this commit", value: "--skip", danger: true }] : []),
+    ] });
+    if (!r) return;
+    if (r === "view") {
+      this.setTab("files", "files", cx);
+      return this.select("files", this.rows("files").findIndex((x) => x.file?.conflict), cx);
+    }
+    // Staged resolutions are what continuing commits; offer to stage the rest.
+    const unstaged = this.files.some((f) => f.unstaged && !f.untracked && !f.conflict);
+    if (r === "--continue" && unstaged && await confirm("Stage all changes first?", "Unstaged changes aren't part of what continuing commits.", "Stage all and continue", false))
+      await this.w(["add", "-u"]);
+    this.busy = `${OPS[op]}…`;
+    await this.w([cmd, r], { timeout: 120000 });
+  }
+
   // --- Remote ---
   async push(force = false) {
     const h = this.head;
@@ -728,13 +785,24 @@ class Sidebar {
     const act = (label, work) => this.act(label, work, cx);
     const changed = row?.file ? [row.file] : row?.files ?? [];
     const stages = changed.some((f) => f.unstaged), stagesAll = this.files.some((f) => f.unstaged);
+    const wholeConflict = row?.file?.whole;
     const ref = this.refOf(row), short = row?.commit?.short ?? row?.reflog?.short ?? ref;
     const remoteOf = (name) => [name.slice(0, name.indexOf("/")), name.slice(name.indexOf("/") + 1)];
     const copy = ["Copy name", () => ref && cx.write_to_clipboard(ref)];
     const diffAgainst = ["Diff against this (W again to stop)", () => { if (ref) { this.diffBase = this.diffBase === ref ? null : ref; this.show(cx); } }];
     const mergeRebase = {
       M: ["Merge into the current branch", () => ref && act(`Merging ${ref}…`, async () => {
-        if (await confirm(`Merge ${ref} into ${this.head.branch}?`, null, "Merge", false)) await this.w(["merge", "--no-edit", ref], { timeout: 120000 });
+        // lazygit's merge options; squash leaves the changes staged, or commits them with git's message.
+        const r = await ask({ title: `Merge ${ref} into ${this.head.branch}`, items: [
+          { key: "m", label: "Merge (fast-forward when it can)", value: "merge" },
+          { key: "n", label: "Merge commit, even when it could fast-forward (--no-ff)", value: "--no-ff" },
+          { key: "f", label: "Fast-forward only (--ff-only)", value: "--ff-only" },
+          { key: "s", label: "Squash, leave the changes staged", value: "--squash" },
+          { key: "S", label: "Squash and commit", value: "squash-commit" },
+        ] });
+        if (!r) return;
+        await this.w(["merge", "--no-edit", ...(r === "merge" ? [] : r === "squash-commit" ? ["--squash"] : [r]), ref], { timeout: 120000 });
+        if (r === "squash-commit") await this.w(["commit", "--no-edit"]);
       })],
       r: ["Rebase the current branch onto this", () => ref && act(`Rebasing onto ${ref}…`, async () => {
         if (await confirm(`Rebase ${this.head.branch} onto ${ref}?`, null, "Rebase", false)) await this.w(["rebase", "--autostash", ref], { timeout: 120000 });
@@ -743,8 +811,10 @@ class Sidebar {
     const panelKeys = {
       files: {
         space: [stages ? "Stage" : "Unstage", () => row && act(stages ? "Staging…" : "Unstaging…", () => this.toggleStage(row))],
-        enter: [row?.file?.sub ? "Open submodule" : row?.dir ? "Fold folder" : "View diff (stage lines)", () => {
-          if (row?.dir) { this.collapsed.has(row.dir) ? this.collapsed.delete(row.dir) : this.collapsed.add(row.dir); }
+        enter: [wholeConflict ? "Resolve conflict…" : row?.file?.sub ? "Open submodule" : row?.dir ? "Fold folder" : "View diff (stage lines)", () => {
+          // A conflict without markers (a submodule, a side deleted) is picked whole, as lazygit does.
+          if (wholeConflict) act("Resolving…", () => this.resolveFile(row.file));
+          else if (row?.dir) { this.collapsed.has(row.dir) ? this.collapsed.delete(row.dir) : this.collapsed.add(row.dir); }
           else if (row?.file?.sub) this.enter(row.file.path, cx);
           else this.focusDiff();
         }],
@@ -781,16 +851,7 @@ class Sidebar {
           else if (r === "unstage") await this.w(["reset", "-q"]);
           else if (r) await this.w(["reset", r, "-q", up]);
         })],
-        ...(row?.file?.conflict ? { M: ["Resolve conflict…", () => act("Resolving…", async () => {
-          const p = row.file.path;
-          const r = await ask({ title: `Resolve ${p}`, detail: "enter on the file picks conflict by conflict in the diff pane.", items: [
-            { key: "o", label: "Keep ours (the checked out side)", value: "--ours" },
-            { key: "t", label: "Keep theirs (the incoming side)", value: "--theirs" },
-            { key: "m", label: "Open git mergetool in a terminal", value: "tool" },
-          ] });
-          if (r === "tool") return this.inTerminal(["git", "mergetool", "--", p]);
-          if (r) { await this.w(["checkout", r, "--", p]); await this.w(["add", "--", p]); }
-        })] } : {}),
+        ...(row?.file?.conflict ? { M: ["Resolve conflict…", () => act("Resolving…", () => this.resolveFile(row.file))] } : {}),
         "|3": null,
         s: ["Stash all changes…", () => act("Stashing…", async () => {
           const r = await ask({ title: "Stash all changes", input: { placeholder: "Stash message (optional)" } });
@@ -1168,20 +1229,7 @@ class Sidebar {
       "[": () => { const tabs = PANELS[index].tabs, n = tabs.findIndex(([id]) => id === this.tabs[this.panel]); this.setTab(this.panel, tabs[(n + tabs.length - 1) % tabs.length][0], cx); },
       "]": () => { const tabs = PANELS[index].tabs, n = tabs.findIndex(([id]) => id === this.tabs[this.panel]); this.setTab(this.panel, tabs[(n + 1) % tabs.length][0], cx); },
       ...Object.fromEntries(PANELS.map((p, n) => [String(n + 1), () => this.select(p.id, this.sel[this.viewOf(p.id)] ?? 0, cx)])),
-      ...(busy ? { m: [`${OPS[busy]}: continue / abort…`, () => act("…", async () => {
-        const cmd = busy.startsWith("rebase") ? "rebase" : busy === "MERGE_HEAD" ? "merge" : busy === "CHERRY_PICK_HEAD" ? "cherry-pick" : "revert";
-        const r = await ask({ title: OPS[busy], detail: this.files.some((f) => f.conflict) ? "There are still conflicts." : null, items: [
-          { key: "c", label: "Continue", value: "--continue" }, { key: "a", label: "Abort", value: "--abort", danger: true },
-          ...(cmd !== "merge" ? [{ key: "s", label: "Skip this commit", value: "--skip", danger: true }] : []),
-        ] });
-        if (!r) return;
-        // Staged resolutions are what continuing commits; offer to stage the rest.
-        const unstaged = this.files.some((f) => f.unstaged && !f.untracked && !f.conflict);
-        if (r === "--continue" && unstaged && await confirm("Stage all changes first?", "Unstaged changes aren't part of what continuing commits.", "Stage all and continue", false))
-          await this.w(["add", "-u"]);
-        this.busy = `${OPS[busy]}…`;
-        await this.w([cmd, r], { timeout: 120000 });
-      })] } : {}),
+      ...(busy ? { m: [`${OPS[busy]}: continue / abort…`, () => act("…", (cx) => this.opMenu(busy, {}, cx))] } : {}),
       "|44": null,
       "/": ["Filter this list", () => {
         if (this.filterView !== view) { this.filter.set_value(""); this.filterText = ""; this.filterView = view; }

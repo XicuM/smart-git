@@ -91,6 +91,10 @@ export function parseStatus(text) {
       const f = e.split(" "), fixed = e[0] === "1" ? 8 : e[0] === "2" ? 9 : 10;
       const file = { path: f.slice(fixed).join(" "), x: f[1][0], y: f[1][1], sub: f[2][0] === "S" ? f[2] : null, conflict: e[0] === "u" };
       if (e[0] === "2") file.from = parts[++i];
+      // A conflict's versions in the index: ours (stage 2) and theirs (stage 3), null where that side deleted it.
+      if (file.conflict) { file.ours = /^0+$/.test(f[8]) ? null : f[8]; file.theirs = /^0+$/.test(f[9]) ? null : f[9]; }
+      // No markers to pick from (a submodule, a side deleted it): resolved by keeping one side whole.
+      if (file.conflict) file.whole = Boolean(file.sub) || !file.ours || !file.theirs;
       files.push(file);
     }
   }
