@@ -157,7 +157,7 @@ class Sidebar {
 
   clear() {
     this.head = {}; this.files = []; this.branches = []; this.commits = []; this.stash = []; this.submodules = []; this.worktrees = [];
-    this.remotes = []; this.remoteBranches = []; this.tags = []; this.reflog = []; this.ops = []; this.todo = []; this.gitDir = ""; this.raw = null;
+    this.remotes = []; this.remoteBranches = []; this.tags = []; this.reflog = []; this.ops = []; this.todo = []; this.gitDir = ""; this.raw = null; this.unpushed = 0;
     this.sel = {}; this.inRemote = null; this.diffBase = null; this.pathFilter = null; this.info = null;
   }
 
@@ -189,7 +189,7 @@ class Sidebar {
   // and the refresh only updates it.
   go(stack, cx) {
     if (this.where) entered.set(this.where, stack);
-    const key = (st) => JSON.stringify(st), keep = ["head", "files", "branches", "commits", "stash", "submodules", "worktrees", "remotes", "remoteBranches", "tags", "reflog", "ops", "todo", "gitDir", "sel", "inRemote", "stamp", "raw"];
+    const key = (st) => JSON.stringify(st), keep = ["head", "files", "branches", "commits", "stash", "submodules", "worktrees", "remotes", "remoteBranches", "tags", "reflog", "ops", "todo", "unpushed", "gitDir", "sel", "inRemote", "stamp", "raw"];
     if (this.stack.length) seen.set(key(this.stack), Object.fromEntries(keep.map((k) => [k, this[k]])));
     if (this.stack.length) drafts.set(key(this.stack), [this.subject.value(), this.body.value()]);
     const [subject = "", body = ""] = drafts.get(key(stack)) ?? [];
@@ -238,7 +238,7 @@ class Sidebar {
     let same = false;
     cx.spawn(async (cx) => {
       try {
-        const [status, branches, log, stash, subs, subConfig, worktrees, remotes, remoteBranches, tags, reflog, state] = await Promise.all([
+        const [status, branches, log, stash, subs, subConfig, worktrees, remotes, remoteBranches, tags, reflog, state, unpushed] = await Promise.all([
           git(repo, ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]),
           git(repo, ["for-each-ref", "--sort=-committerdate", `--format=${BRANCH_FORMAT}`, "refs/heads"]),
           soft(git(repo, ["log", `--format=${LOG_FORMAT}`, "-n", "300", "HEAD", "--", ...(this.pathFilter ? [this.pathFilter] : [])])),
@@ -251,6 +251,8 @@ class Sidebar {
           git(repo, ["for-each-ref", "--sort=-creatordate", `--format=${REF_FORMAT}`, "refs/tags"]),
           soft(git(repo, ["reflog", `--format=${REFLOG_FORMAT}`, "-n", "300"])),
           exec("sh", ["-c", STATE], { cwd: repo.root, on: repo.on }).then((r) => r.stdout),
+          // Commits on no remote, for a branch with no upstream to count them against. Capped at the log's 300.
+          soft(git(repo, ["rev-list", "--count", "-n", "300", "HEAD", "--not", "--remotes"])),
         ]);
         if (repo !== this.repo) return;
         // Nothing changed (the timer, or a change git doesn't show): no redraw.
@@ -262,6 +264,8 @@ class Sidebar {
         this.commits = parseLog(log); this.stash = parseStash(stash); if (subs !== null) this.submodules = parseSubmodules(subs, subConfig);
         this.worktrees = parseWorktrees(worktrees); this.remotes = parseRemotes(remotes); this.remoteBranches = parseRefs(remoteBranches);
         this.tags = parseRefs(tags); this.reflog = parseReflog(reflog);
+        // With no remote branches at all every commit is "unpushed", which says nothing: those stay unmarked.
+        this.unpushed = this.head.upstream ? this.head.ahead : this.remoteBranches.length ? +unpushed || 0 : 0;
         const [dir, ...rest] = state.split("\n"), t = rest.indexOf("--todo");
         this.gitDir = dir; this.ops = (t < 0 ? rest : rest.slice(0, t)).filter(Boolean);
         this.todo = t < 0 ? [] : rest.slice(t + 1).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"))
@@ -295,7 +299,7 @@ class Sidebar {
     if (view === "commits") {
       // A rebase's todo comes first, the last to be applied on top, as lazygit shows it.
       const todo = this.todo.map((t, n) => ({ id: `todo-${n}`, todo: t, n, text: t.rest })).reverse();
-      return [...todo, ...this.commits.map((c, n) => ({ id: c.hash, commit: c, ahead: n < this.head.ahead, text: `${c.short} ${c.subject}` }))].filter(keep);
+      return [...todo, ...this.commits.map((c, n) => ({ id: c.hash, commit: c, ahead: n < this.unpushed, text: `${c.short} ${c.subject}` }))].filter(keep);
     }
     // Built once per change of what it's made of, not on every key and draw.
     const made = [this.files, q, this.tree, [...this.collapsed].join("\0")];

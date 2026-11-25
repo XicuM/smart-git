@@ -515,7 +515,8 @@ export class Diff {
     const out = [];
     let refs = [], room = this.width - left - (CHAR * 16 + 8) - (this.authorW() + 8) - CHAR * 4 - 10;
     for (const ref of r.refs) {
-      if (refs.length && wide(ref) > room) {
+      // Even the first label moves down when it doesn't fit, leaving the subject its row.
+      if ((refs.length || !out.length) && wide(ref) > room) {
         out.push(out.length ? { ...r, refs, cont: true } : { ...r, refs });
         refs = []; room = this.width - left - 10;
       }
