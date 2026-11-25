@@ -28,23 +28,22 @@ const PANELS = [
 ];
 // What a repository in the middle of something is doing, by the file git keeps for it.
 const OPS = { "rebase-merge": "Rebasing", "rebase-apply": "Rebasing", MERGE_HEAD: "Merging", CHERRY_PICK_HEAD: "Cherry-picking", REVERT_HEAD: "Reverting", BISECT_LOG: "Bisecting" };
-// What the commit actions do to history, shown beside them in the menus (hover, or the selected row).
-const REWRITE = "Rewrites this commit and every one after it (new hashes): a pushed branch then needs a force push. z undoes it.";
+// What each action does, shown beside it in the menus (hover, or the selected row).
 const EXPLAIN = {
   commits: {
     space: "Moves HEAD to this commit without a branch (detached). Commits you make there are lost unless you create a branch.",
     g: "Moves the branch back to this commit. Commits after it leave the branch (the reflog keeps them); soft, mixed or hard says what happens to their changes.",
-    r: `Changes this commit's message only. ${REWRITE}`,
-    s: `Melds this commit into the older one below it, keeping both messages. ${REWRITE}`,
-    f: `Melds this commit into the older one below it and discards this commit's message. ${REWRITE}`,
-    d: `Removes this commit and its changes from the branch; the commits after it are replayed without it and may conflict. ${REWRITE}`,
+    r: "Changes this commit's message only.",
+    s: "Melds this commit into the older one below it, keeping both messages.",
+    f: "Melds this commit into the older one below it and discards this commit's message.",
+    d: "Removes this commit and its changes from the branch; the commits after it are replayed without it and may conflict.",
     e: "Starts a rebase that stops at this commit, so you can amend it or split it; m continues.",
     i: "Starts a rebase that stops just before this commit: reorder, squash or drop what follows, then m continues.",
-    "ctrl-j": `Swaps this commit with the older one below it; they may conflict. ${REWRITE}`,
-    "ctrl-k": `Swaps this commit with the newer one above it; they may conflict. ${REWRITE}`,
-    A: `Adds the staged changes into this commit. ${REWRITE}`,
+    "ctrl-j": "Swaps this commit with the older one below it; they may conflict.",
+    "ctrl-k": "Swaps this commit with the newer one above it; they may conflict.",
+    A: "Adds the staged changes into this commit.",
     F: "Makes a new \"fixup!\" commit of the staged changes, to meld into this one later (S). Nothing is rewritten yet.",
-    S: `Melds every "fixup!" commit made for this one into it. ${REWRITE}`,
+    S: "Melds every \"fixup!\" commit made for this one into it.",
     t: "Adds a new commit that undoes this one. Nothing is rewritten: safe on pushed branches.",
     V: "Applies the copied commits on top of the current branch as new commits; they may conflict.",
   },
@@ -54,7 +53,7 @@ const EXPLAIN = {
     d: "Deletes the branch name only; commits stay in the reflog. Git refuses if it is not merged, and a second prompt can force it.",
     R: "Renames the branch locally. Its upstream and any remote copy keep the old name.",
     M: "Brings that branch's commits into the current one (a dialog offers merge, fast-forward only or squash). The other branch does not change; history is kept as it was.",
-    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear, but those commits get new hashes: a pushed branch then needs a force push. z undoes it.",
+    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear.",
     n: "Creates a new branch starting at this one and checks it out.",
     W: "Shows what differs between this and what you have checked out, without changing anything. Press again to stop.",
   },
@@ -63,7 +62,7 @@ const EXPLAIN = {
     u: "Makes this the upstream of your current branch, so p pulls from it and P pushes to it.",
     d: "Deletes the branch on the remote itself, for everyone. Your local branches are untouched.",
     M: "Brings that branch's commits into the current one (a dialog offers merge, fast-forward only or squash). The other branch does not change; history is kept as it was.",
-    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear, but those commits get new hashes: a pushed branch then needs a force push. z undoes it.",
+    r: "Replays the current branch's own commits on top of that branch, as new commits. History stays linear.",
     n: "Creates a new branch starting at this one and checks it out.",
     W: "Shows what differs between this and what you have checked out, without changing anything. Press again to stop.",
   },

@@ -92,7 +92,7 @@ export class Diff {
     this.scroll = VirtualListScrollHandle.new();
     // The file panel and pinned bar follow the file at the top of the list; scrolling doesn't
     // redraw this view, so look for a new one now and then.
-    this.paneW = 600; this.top = 0; this.stat = null; this.panelW = shared("smart-git:panelW") ?? 240;
+    this.paneW = 600; this.top = 0; this.pad = 0; this.stat = null; this.panelW = shared("smart-git:panelW") ?? 240;
     cx.timer.every(100, (cx) => {
       if (this.stat && this.fileAt() !== this.spied) cx.notify();
     });
@@ -110,16 +110,13 @@ export class Diff {
     if (!f) return;
     const c = this.rows.findIndex((x, j) => j > f.i && (isChange(x) || x.kind === "f"));
     if (isChange(this.rows[c])) { this.cur = c; this.hunk = false; this.anchor = null; }
-    // The list only scrolls the least it can ("near edge"): a header above the view goes to the
-    // top by itself. One below: first the row a screen under it to the bottom edge, which leaves
-    // the header just above the view, then (next frame) the header, now above, to the top.
-    const vis = this.visual(), at = vis.findIndex((x) => (x.left ?? x).i === f.i);
+    // A screen of blank rows after the last (`pad`, as VS Code) lets any header reach the top. The
+    // list only scrolls the least it can ("near edge"), so: to the end, then (next frame) back up
+    // to the header, which comes in at the top edge.
+    const at = this.visual().findIndex((x) => (x.left ?? x).i === f.i);
     if (at < 0) return;
-    if (at > this.top) {
-      this.scroll.scroll_to_item(Math.min(at + Math.ceil((this.listH ?? 0) / ROW), vis.length - 1));
-      cx.timer.after(30, (cx) => { this.scroll.scroll_to_item(at); cx.notify(); });
-    } else this.scroll.scroll_to_item(at);
-    this.top = at;
+    this.scroll.scroll_to_item(this.visual().length + this.pad - 1);
+    cx.timer.after(30, (cx) => { this.scroll.scroll_to_item(at); this.top = at; cx.notify(); });
   }
 
   // What the sidebar selected; reloads when it (or how it's shown) changes. Render calls this.
@@ -717,6 +714,8 @@ export class Diff {
     // Side by side outranks the panel: it shows only when the diff keeps the 900px that auto
     // needs for side by side beside it (520 when unified). Its width is dragged; 0 hides it.
     const room = (w) => this.paneW - w - 1 >= (this.layout === "unified" ? 520 : 902);
+    // With a file list, blank rows after the last so the last file's header can reach the top.
+    this.pad = stat ? Math.max(0, Math.floor((this.listH ?? 0) / ROW) - 1) : 0;
     const panel = Boolean(stat) && this.panelW > 0 && room(this.panelW), canShow = Boolean(stat) && this.panelW === 0 && room(240);
     const setPanel = (w) => { this.panelW = w; setShared("smart-git:panelW", w); };
     const counts = (x) => [x.add ? div().flex_none().text_color(t.ansi2).child(`+${x.add}`) : null, x?.del ? div().flex_none().text_color(t.ansi1).child(`−${x.del}`) : null].filter(Boolean);
@@ -800,16 +799,18 @@ export class Diff {
         .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
         .when(Boolean(stat), (e) => e.child(pin))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
-        .on_size_change((size) => { this.listH = size.height / (Number(settings().zoom) || 1); })
+        .on_size_change((size, cx) => { const h = size.height / (Number(settings().zoom) || 1); if (Math.abs(h - (this.listH ?? 0)) > 1) { this.listH = h; cx.notify(); } })
         .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))
           // Where a press lands says which side of a row was clicked: the list only names the row.
           .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); this.clicks = e.click_count; })
-            .child(v_virtual_list("smart-git-rows", rows.length, ROW, (i) => String(i),
+            .child(v_virtual_list("smart-git-rows", rows.length + this.pad, ROW, (i) => String(i),
             (range) => {
               // The measuring pass asks for one row; the placing pass says what's at the top.
               if (range.end - range.start > 1) this.top = range.start;
-              return rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k));
+              const out = rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k));
+              for (let i = Math.max(range.start, rows.length); i < range.end; i++) out.push(div().id(`v-${i}`).h(ROW).flex_none());
+              return out;
             }).track_scroll(this.scroll).size_full()
             .on_item_click((key, cx) => {
               const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
