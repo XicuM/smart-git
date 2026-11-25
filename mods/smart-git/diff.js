@@ -94,9 +94,7 @@ export class Diff {
     // redraw this view, so look for a new one now and then.
     this.paneW = 600; this.top = 0; this.stat = null; this.panelW = shared("smart-git:panelW") ?? 240;
     cx.timer.every(100, (cx) => {
-      if (!this.stat) return;
-      this.top = Math.floor(this.scroll.offset().y / ROW);
-      if (this.fileAt() !== this.spied) cx.notify();
+      if (this.stat && this.fileAt() !== this.spied) cx.notify();
     });
   }
 
@@ -107,17 +105,20 @@ export class Diff {
   }
 
   // A file picked in the panel: its header at the top, the cursor on its first change.
-  toFile(n) {
+  toFile(n, cx) {
     const f = this.stat?.files[n];
     if (!f) return;
     const c = this.rows.findIndex((x, j) => j > f.i && (isChange(x) || x.kind === "f"));
     if (isChange(this.rows[c])) { this.cur = c; this.hunk = false; this.anchor = null; }
     // The list only scrolls the least it can ("near edge"): a header above the view goes to the
-    // top by itself; for one below, the row a screen under it goes to the bottom edge instead.
+    // top by itself. One below: first the row a screen under it to the bottom edge, which leaves
+    // the header just above the view, then (next frame) the header, now above, to the top.
     const vis = this.visual(), at = vis.findIndex((x) => (x.left ?? x).i === f.i);
     if (at < 0) return;
-    const top = Math.floor(this.scroll.offset().y / ROW), screen = Math.max(1, Math.floor(this.scroll.viewport_size().height / ROW));
-    this.scroll.scroll_to_item(at > top ? Math.min(at + screen - 1, vis.length - 1) : at);
+    if (at > this.top) {
+      this.scroll.scroll_to_item(Math.min(at + Math.ceil((this.listH ?? 0) / ROW), vis.length - 1));
+      cx.timer.after(30, (cx) => { this.scroll.scroll_to_item(at); cx.notify(); });
+    } else this.scroll.scroll_to_item(at);
     this.top = at;
   }
 
@@ -731,7 +732,7 @@ export class Diff {
     const fileList = (id) => div().flex_1().min_h(0).relative()
       .child(div().absolute().inset_0().child(v_virtual_list(id, files.length, 24, (i) => String(i),
         (range) => files.slice(range.start, range.end).map((f, k) => fileRow(f, range.start + k))).size_full()
-        .on_item_click((key, cx) => { this.toFile(Number(key)); this.drop = false; this.handle.focus(); cx.notify(); })))
+        .on_item_click((key, cx) => { this.toFile(Number(key), cx); this.drop = false; this.handle.focus(); cx.notify(); })))
       .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0());
     const cur = at === null ? null : files[at];
     const pin = h_flex().id("pin").h(26).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).bg(t.surface).whitespace_nowrap()
@@ -799,12 +800,17 @@ export class Diff {
         .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
         .when(Boolean(stat), (e) => e.child(pin))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
+        .on_size_change((size) => { this.listH = size.height / (Number(settings().zoom) || 1); })
         .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))
           // Where a press lands says which side of a row was clicked: the list only names the row.
           .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); this.clicks = e.click_count; })
             .child(v_virtual_list("smart-git-rows", rows.length, ROW, (i) => String(i),
-            (range) => rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k))).track_scroll(this.scroll).size_full()
+            (range) => {
+              // The measuring pass asks for one row; the placing pass says what's at the top.
+              if (range.end - range.start > 1) this.top = range.start;
+              return rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k));
+            }).track_scroll(this.scroll).size_full()
             .on_item_click((key, cx) => {
               const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
               this.handle.focus();
