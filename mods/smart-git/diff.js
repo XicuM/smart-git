@@ -92,7 +92,7 @@ export class Diff {
     this.scroll = VirtualListScrollHandle.new();
     // The file panel and pinned bar follow the file at the top of the list; scrolling doesn't
     // redraw this view, so look for a new one now and then.
-    this.paneW = 600; this.top = 0; this.stat = null;
+    this.paneW = 600; this.top = 0; this.stat = null; this.panelW = shared("smart-git:panelW") ?? 240;
     cx.timer.every(100, (cx) => { if (this.stat && this.fileAt() !== this.spied) cx.notify(); });
   }
 
@@ -687,7 +687,11 @@ export class Diff {
     // The files a commit, stash or range changes: a panel beside the diff when the pane is wide,
     // else a list the pinned bar opens. The pinned bar names the file at the top of the list.
     const stat = this.stat, files = stat?.files ?? [], at = (this.spied = this.fileAt());
-    const panel = Boolean(stat) && this.paneW >= 760, PANEL = 240;
+    // Side by side outranks the panel: it shows only when the diff keeps the 900px that auto
+    // needs for side by side beside it (520 when unified). Its width is dragged; 0 hides it.
+    const room = (w) => this.paneW - w - 1 >= (this.layout === "unified" ? 520 : 902);
+    const panel = Boolean(stat) && this.panelW > 0 && room(this.panelW), canShow = Boolean(stat) && this.panelW === 0 && room(240);
+    const setPanel = (w) => { this.panelW = w; setShared("smart-git:panelW", w); };
     const counts = (x) => [x.add ? div().flex_none().text_color(t.ansi2).child(`+${x.add}`) : null, x?.del ? div().flex_none().text_color(t.ansi1).child(`−${x.del}`) : null].filter(Boolean);
     const letter = (f) => div().w(CHAR).flex_none().font_semibold().text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : t.blocked).child(f.status);
     const split2 = (f) => { const n = f.name.lastIndexOf("/") + 1; return [f.name.slice(0, n), f.name.slice(n)]; };
@@ -711,12 +715,27 @@ export class Diff {
         .child(div().flex_1()).child(div().flex_none().text_color(t.dim).child(`${at + 1}/${files.length}`)); })
       .when(!cur && Boolean(stat), (e) => e.child(div().font_semibold().child(`${files.length} file${files.length > 1 ? "s" : ""} changed`)).children(counts(stat ?? {}))
         .when(Boolean(stat?.partial), (e) => e.child(div().text_color(t.blocked).child("counted in the first 20000 lines"))).child(div().flex_1()))
+      // Dragged shut, with room for it again: a button brings the panel back.
+      .when(canShow, (e) => e.child(div().id("show-panel").tooltip("Show the file list").size(20).flex_none().flex().items_center().justify_center().rounded(4)
+        .text_color(t.dim).hover((s) => s.bg(t.hover)).cursor_pointer()
+        .on_click((_e, cx) => { cx.stop_propagation(); this.drop = false; setPanel(240); cx.notify(); }).child(svg("mods/smart-git/list.svg").size(12))))
       .when(!panel, (e) => e.child(svg(`mods/workspace-chrome/chevron-${this.drop ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim)));
     return v_flex().id("smart-git-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12)
       .track_focus(this.handle).on_key_down((e, cx) => { if (this.key(keyOf(e), cx)) cx.stop_propagation(); })
       // Sizes come back zoomed; lengths given to elements get zoomed again, so measure unzoomed.
-      .on_mouse_move((e, cx) => { if (this.drag) { this.dx = this.drag.dx + (e.position.x - this.drag.x) / zoom * this.drag.k; cx.notify(); } })
-      .on_mouse_up("left", (_e, cx) => { if (this.drag) { this.drag = null; cx.notify(); } })
+      .on_mouse_move((e, cx) => {
+        if (this.drag) { this.dx = this.drag.dx + (e.position.x - this.drag.x) / zoom * this.drag.k; cx.notify(); }
+        // The panel's edge: 160px to 40% of the pane; dragged under 120 it closes.
+        // Never so wide that the diff loses the room it needs (`room` in render).
+        if (this.resize) {
+          const w = this.resize.w + (e.position.x - this.resize.x) / zoom, max = Math.min(this.paneW * 0.4, this.paneW - 1 - (this.layout === "unified" ? 520 : 902));
+          this.panelW = w < 120 ? 0 : Math.round(Math.max(160, Math.min(w, max))); cx.notify();
+        }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        if (this.drag) { this.drag = null; cx.notify(); }
+        if (this.resize) { this.resize = null; setPanel(this.panelW); cx.notify(); }
+      })
       .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.paneW) > 1) { this.paneW = w; cx.notify(); } })
       .child(h_flex().h(32).flex_none().px(10).gap(2).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().font_semibold().child(this.title ?? "Select something in the git panel"))
@@ -735,11 +754,19 @@ export class Diff {
         .child(this.ws ? "Nothing to show: only whitespace changed (ctrl-w shows it)" : "Nothing to show here")))
       .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child(this.shown?.note ?? "No conflict markers left. M in the files list keeps one side of the whole file.")))
       .child(div().flex_1().min_h(0).relative().child(h_flex().absolute().inset_0().items_start()
-       .when(panel, (e) => e.child(v_flex().w(PANEL).flex_none().h_full().border_r(1).border_color(t.border)
+       .when(panel, (e) => e.child(v_flex().w(this.panelW).flex_none().h_full()
          .child(h_flex().h(26).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).whitespace_nowrap()
            .child(div().font_semibold().child(`${files.length} file${files.length > 1 ? "s" : ""}`)).children(counts(stat))
            .when(Boolean(stat?.partial), (e) => e.child(div().text_color(t.blocked).child("partial"))))
-         .child(fileList("smart-git-files"))))
+         .child(fileList("smart-git-files")))
+         // Its edge: drag to resize, double-click for the default width.
+         .child(div().id("panel-edge").w(5).h_full().flex_none().cursor_col_resize().border_l(1).border_color(t.border)
+           .when(Boolean(this.resize), (e) => e.bg(t.accent)).hover((s) => s.bg(t.hover))
+           .on_mouse_down("left", (e, cx) => {
+             cx.stop_propagation();
+             if (e.click_count >= 2) { this.resize = null; setPanel(240); } else this.resize = { x: e.position.x, w: this.panelW };
+             cx.notify();
+           })))
        // The diff's own width is what its rows are laid out to.
        .child(v_flex().flex_1().min_w(0).h_full().relative()
         .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
