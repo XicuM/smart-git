@@ -8,7 +8,7 @@ import { ask, askFrom, keyOf } from "./ask.js";
 import { perf, git, writeThere, rebaseWith, openEditor, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
 
 const ROW = 20, CHAR = 7.3;
-const BANDS = ["s", "F", "f", "@", "g", "h", "<", "|", "=", ">"];
+const BANDS = ["s", "f", "@", "g", "h", "<", "|", "=", ">"];
 const isChange = (r) => r?.kind === "+" || r?.kind === "-";
 // Selections shown as a commit graph rather than a diff.
 const LOGS = ["branch", "remote", "status"];
@@ -52,7 +52,8 @@ function sources(s, o) {
     if (s.staged) out.push(["Staged changes", ["diff", "--cached", ...flags, ...path]]);
     return out;
   }
-  if (s.kind === "commit") return [[null, ["show", ...flags, "--format=commit %H%d%nAuthor: %an <%ae>%nDate:   %ad (%ar)%n%n%w(0,4,4)%B", s.hash]]];
+  // A meta line (hash, refs, author, when, parents) the pane draws as one row, then the message.
+  if (s.kind === "commit") return [[null, ["show", ...flags, "--decorate=full", "--format=meta %h%x1f%D%x1f%an%x1f%ar%x1f%p%n%w(0,4,4)%B", s.hash]]];
   if (s.kind === "range") return [[null, ["diff", ...flags, s.from, s.to]]];
   if (s.kind === "stash") return [[null, ["stash", "show", "-p", ...flags, "--include-untracked", s.ref]]];
   // Children before parents, as the lanes need; a stash's index commit isn't history.
@@ -89,6 +90,26 @@ export class Diff {
     this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = [];
     this.handle = cx.focus_handle();
     this.scroll = VirtualListScrollHandle.new();
+    // The file panel and pinned bar follow the file at the top of the list; scrolling doesn't
+    // redraw this view, so look for a new one now and then.
+    this.paneW = 600; this.top = 0; this.stat = null;
+    cx.timer.every(100, (cx) => { if (this.stat && this.fileAt() !== this.spied) cx.notify(); });
+  }
+
+  // The file (index in stat.files) at the top of the list, or null above the first one.
+  fileAt() {
+    const v = this.visual()[this.top];
+    return v ? this.rows[v.i ?? v.left?.i ?? v.right?.i]?.fi ?? null : null;
+  }
+
+  // A file picked in the panel: its header at the top, the cursor on its first change.
+  toFile(n) {
+    const f = this.stat?.files[n];
+    if (!f) return;
+    const c = this.rows.findIndex((x, j) => j > f.i && (isChange(x) || x.kind === "f"));
+    if (isChange(this.rows[c])) { this.cur = c; this.hunk = false; this.anchor = null; }
+    const at = this.visual().findIndex((x) => (x.left ?? x).i === f.i);
+    if (at >= 0) this.scroll.scroll_to_item(at, "top");
   }
 
   // What the sidebar selected; reloads when it (or how it's shown) changes. Render calls this.
@@ -152,6 +173,38 @@ export class Diff {
       } catch (e) { if (this.loaded === key) this.error = String(e.message ?? e); }
       if (this.loaded !== key) return;
       this.truncated = truncated; this.pending = false;
+      // What a commit, stash or range changes, file by file (lazygit's --stat), for the file panel
+      // and the pinned bar. Every row after a file's header knows that file (`fi`).
+      let stat = null;
+      if (["commit", "stash", "range"].includes(s.kind)) {
+        const files = [];
+        for (const r of rows) {
+          if (r.kind === "f") {
+            const n = r.notes ?? [], has = (w) => n.some((x) => x.startsWith(w));
+            r.add = r.del = 0; r.name = r.path ?? r.text.replace(/^Submodule (\S+).*/, "$1");
+            r.status = has("new file") ? "A" : has("deleted") ? "D" : has("renamed") ? "R" : has("copied") ? "C" : "M";
+            files.push(r);
+          }
+          const f = files.at(-1);
+          if (!f) continue;
+          r.fi = files.length - 1;
+          if (r.kind === "+") f.add++; else if (r.kind === "-") f.del++;
+        }
+        if (files.length) stat = { files, add: files.reduce((n, f) => n + f.add, 0), del: files.reduce((n, f) => n + f.del, 0), partial: truncated > 0 };
+      }
+      // A commit's header: the meta line, then the message unindented, its subject bold and its
+      // trailers dim, one blank line before the first file.
+      if (s.kind === "commit" && rows[0]?.text.startsWith("meta ")) {
+        const [short, refs, author, when, parents = ""] = rows[0].text.slice(5).split("\x1f");
+        rows[0].meta = { short, author, when, merge: parents.trim().includes(" "), refs: refs ? refs.split(", ") : [] };
+        rows[0].text = "";
+        let end = rows.findIndex((r) => r.kind !== "h");
+        if (end < 0) end = rows.length;
+        for (const r of rows.slice(1, end)) { r.text = r.text.replace(/^ {4}/, ""); r.trailer = /^([\w-]+-by|Change-Id): /i.test(r.text); }
+        const subject = rows.slice(1, end).find((r) => r.text.trim());
+        if (subject) subject.title = true;
+        while (end > 2 && !rows[end - 1].text.trim() && !rows[end - 2].text.trim()) rows.splice(--end, 1);
+      }
       // Rows added above (a gap opened) keep the cursor on its line while the section is the same.
       const at = this.rows[this.cur], was = at?.kind === "L" ? at.hash : null;
       if (same && at?.raw !== undefined && texts[at.src]?.text === this.texts[at.src]?.text) {
@@ -159,32 +212,10 @@ export class Diff {
         const a = this.anchor !== null ? rows.findIndex((r) => r.src === at.src && r.raw === this.rows[this.anchor]?.raw) : -1;
         if (n >= 0) { this.cur = n; this.anchor = a >= 0 ? a : null; }
       }
-      // Lazygit's --stat: what a commit, stash or range changes, file by file, above the first file.
-      if (["commit", "stash", "range"].includes(s.kind)) {
-        let head = null;
-        for (const r of rows) {
-          if (r.kind === "f") { head = r; r.add = r.del = 0; } else if (head && r.kind === "+") head.add++; else if (head && r.kind === "-") head.del++;
-        }
-        const heads = rows.filter((r) => r.kind === "f");
-        if (heads.length) {
-          const most = Math.max(1, ...heads.map((f) => f.add + f.del)), name = (f) => f.path ?? f.text.replace(/^Submodule (\S+).*/, "$1");
-          const widest = (k) => Math.max(...heads.map((f) => f[k] ? String(f[k]).length + 1 : 0));
-          const cols = { w: Math.min(60, Math.max(...heads.map((f) => name(f).length))), aw: widest("add"), dw: widest("del"), most };
-          // One blank line above it (the message ends with two) and one below.
-          let at = rows.indexOf(heads[0]);
-          while (at > 1 && rows[at - 1].kind === "h" && !rows[at - 1].text.trim() && rows[at - 2].kind === "h" && !rows[at - 2].text.trim()) rows.splice(--at, 1);
-          rows.splice(at, 0,
-            { kind: "F", text: "", count: heads.length, add: heads.reduce((n, f) => n + f.add, 0), del: heads.reduce((n, f) => n + f.del, 0), partial: truncated > 0 },
-            ...heads.map((f) => ({ kind: "F", text: "", file: f, name: name(f), ...cols })),
-            { kind: "h", text: "" });
-        }
-      }
       rows.forEach((r, i) => { r.i = i; });
-      // A commit's subject: the first message line under its header.
-      if (s.kind === "commit") { const t = rows.find((r) => r.kind === "h" && /^ {4}\S/.test(r.text)); if (t) t.title = true; }
-      this.rows = rows; this.texts = texts; this.conflict = conflict; this.pairs = null; this.vis = null;
+      this.rows = rows; this.texts = texts; this.stat = stat; this.conflict = conflict; this.pairs = null; this.vis = null;
       this.longest = rows.reduce((n, r) => Math.max(n, r.text.length), 0);
-      if (!same) { this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = []; this.scroll.scroll_to_item(0); }
+      if (!same) { this.top = 0; this.drop = false; this.cur = -1; this.anchor = null; this.hunk = false; this.ci = 0; this.side = "ours"; this.undo = []; this.scroll.scroll_to_item(0); }
       if (conflict) {
         const cs = conflict.filter((p) => !Array.isArray(p));
         this.ci = Math.min(this.ci, Math.max(0, cs.length - 1));
@@ -398,7 +429,7 @@ export class Diff {
       z: ["Zoom", () => this.zoom()],
       // Side by side, unwrapped: both halves sideways, as lazygit's H/L.
       H: ["Scroll left", () => { this.dx -= 8 * CHAR; }], L: ["Scroll right", () => { this.dx += 8 * CHAR; }],
-      escape: () => { if (this.anchor !== null || this.hunk) { this.anchor = null; this.hunk = false; } else this.back(); },
+      escape: () => { if (this.drop) this.drop = false; else if (this.anchor !== null || this.hunk) { this.anchor = null; this.hunk = false; } else this.back(); },
       q: ["Back", () => this.back()],
       // 1–5 jump to that sidebar section, as from the sidebar; the diff stays zoomed.
       ...Object.fromEntries(["Status", "Files", "Branches", "Commits", "Stash"].map((name, n) => [String(n + 1), [`Sidebar: ${name}`, () => run(`smart-git.sidebar:${n + 1}`)]])),
@@ -479,7 +510,7 @@ export class Diff {
     const pieces = (r, n) => {
       let off = 0;
       return wrapText(r.text, n).map((text, j) => {
-        const p = j === 0 ? { ...r, text } : { kind: r.kind, text, i: r.i, c: r.c, side: r.side, gap: r.gap, hl: r.hl, off };
+        const p = j === 0 ? { ...r, text } : { kind: r.kind, text, i: r.i, c: r.c, side: r.side, gap: r.gap, hl: r.hl, title: r.title, trailer: r.trailer, off };
         off += text.length;
         return p;
       });
@@ -597,38 +628,24 @@ export class Diff {
         .child(div().w(CHAR * 14).flex_none().truncate().text_color(authorColor(r.author)).child(r.author))
         .child(div().w(CHAR * 10).flex_none().text_right().text_color(t.dim).child(r.when.replace(/, \d+ months?/, "").replace(/ ago$/, ""))));
     // A commit's header: labels dim, hash and refs in color, the message in full ink.
+    // A ref of the meta line (`git show --decorate=full`), as a graph label.
+    const refLabel = (ref) => {
+      const [tone, name] = ref.startsWith("HEAD -> ") ? ["head", ref.slice(8)] : ref.startsWith("tag: ") ? ["tag", ref.slice(5)]
+        : ref.startsWith("refs/heads/") ? ["local", ref] : ref.startsWith("refs/remotes/") ? ["remote", ref] : ["other", ref];
+      return label({ tone, name: name.replace(/^refs\/(heads|remotes|tags)\//, "") });
+    };
+    // A commit's header: one meta line (hash, refs, author, when), the subject bold, trailers dim.
     const header = (r) => {
-      const row = h_flex().px(10).h(ROW).flex_none().whitespace_nowrap();
+      const row = h_flex().px(10).h(ROW).flex_none().items_center().whitespace_nowrap();
       if (r.tone) return row.text_color(r.tone === "+" ? t.ansi2 : t.ansi1).child(r.text);
-      const c = /^commit ([0-9a-f]+)(.*)$/.exec(r.text), m = /^(Author:|Date:|Merge:)(.*)$/.exec(r.text);
-      if (c) return row.child(div().text_color(t.dim).child("commit ")).child(div().text_color(t.ansi3).child(c[1])).child(div().font_semibold().text_color(t.ansi6).child(c[2]));
-      if (m) return row.child(div().text_color(t.dim).child(m[1])).child(div().child(m[2]));
-      return row.when(Boolean(r.title), (e) => e.font_semibold()).child(r.text);
+      const m = r.meta;
+      if (m) return row.gap(8).child(div().text_color(t.ansi3).child(m.short)).children(m.refs.map(refLabel))
+        .when(m.merge, (e) => e.child(div().text_color(t.dim).child("merge")))
+        .child(div().text_color(authorColor(m.author)).child(m.author)).child(div().text_color(t.dim).child(m.when));
+      return row.when(Boolean(r.title), (e) => e.font_semibold()).when(Boolean(r.trailer), (e) => e.text_color(t.dim)).child(r.text);
     };
     const band = (r, v) => {
       if (r.kind === "s") return div().px(10).h(ROW).flex_none().bg(t.raised).text_color(t.accent).font_semibold().child(r.text);
-      // The --stat summary, one block: its total, then a row per file (click goes to it).
-      if (r.kind === "F" && !r.file) return h_flex().px(10).gap(8).h(ROW).flex_none().bg(t.surface).whitespace_nowrap()
-        .child(div().font_semibold().child(`${r.count} file${r.count > 1 ? "s" : ""} changed`))
-        .child(div().text_color(t.ansi2).child(`+${r.add}`)).child(div().text_color(t.ansi1).child(`−${r.del}`))
-        .when(r.partial, (e) => e.child(div().text_color(t.blocked).child("counted in the first 20000 lines")));
-      if (r.kind === "F") {
-        const f = r.file, n = f.notes ?? [], has = (w) => n.some((x) => x.startsWith(w));
-        const l = has("new file") ? "A" : has("deleted") ? "D" : has("renamed") ? "R" : has("copied") ? "C" : "M";
-        const cut = r.name.lastIndexOf("/") + 1;
-        return h_flex().id(`stat-${r.i}`).px(10).gap(8).h(ROW).flex_none().bg(t.surface).whitespace_nowrap().cursor_pointer().hover((e) => e.bg(t.hover))
-          .child(div().w(CHAR).flex_none().font_semibold().text_color(l === "A" ? t.ansi2 : l === "D" ? t.ansi1 : t.blocked).child(l))
-          // The folder dim, the file's own name in full ink.
-          .child(h_flex().w(r.w * CHAR).flex_none().overflow_hidden()
-            .child(div().flex_shrink_1().min_w(0).truncate().text_color(t.dim).child(r.name.slice(0, cut)))
-            .child(div().flex_none().child(r.name.slice(cut))))
-          .child(div().w(r.aw * CHAR).flex_none().text_right().text_color(t.ansi2).child(f.add ? `+${f.add}` : ""))
-          .child(div().w(r.dw * CHAR).flex_none().text_right().text_color(t.ansi1).child(f.del ? `−${f.del}` : ""))
-          .child(h_flex().w(80).h(6).flex_none().rounded(3).overflow_hidden()
-            .child(div().h_full().w(80 * f.add / r.most).bg(t.ansi2))
-            .child(div().h_full().w(80 * f.del / r.most).bg(t.ansi1)))
-          .children(n.includes("binary") ? [div().text_color(t.dim).child("binary")] : []);
-      }
       if (r.kind === "f") return h_flex().px(10).gap(10).h(ROW).flex_none().bg(t.raised).whitespace_nowrap()
         .child(div().flex_none().text_color(t.foreground).font_semibold().child(r.text))
         .when(Boolean(r.add || r.del), (e) => e.child(div().flex_none().text_color(t.ansi2).child(r.add ? `+${r.add}` : "")).child(div().flex_none().text_color(t.ansi1).child(r.del ? `−${r.del}` : "")))
@@ -667,12 +684,40 @@ export class Diff {
     const button = (id, name, active, tip, on) => div().id(id).tooltip(tip).size(24).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
       .text_color(active ? t.foreground : t.dim).when(active, (e) => e.bg(t.selection)).hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => { on(); cx.notify(); }).child(svg(`mods/smart-git/${name}.svg`).size(14));
+    // The files a commit, stash or range changes: a panel beside the diff when the pane is wide,
+    // else a list the pinned bar opens. The pinned bar names the file at the top of the list.
+    const stat = this.stat, files = stat?.files ?? [], at = (this.spied = this.fileAt());
+    const panel = Boolean(stat) && this.paneW >= 760, PANEL = 240;
+    const counts = (x) => [x.add ? div().flex_none().text_color(t.ansi2).child(`+${x.add}`) : null, x?.del ? div().flex_none().text_color(t.ansi1).child(`−${x.del}`) : null].filter(Boolean);
+    const letter = (f) => div().w(CHAR).flex_none().font_semibold().text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : t.blocked).child(f.status);
+    const split2 = (f) => { const n = f.name.lastIndexOf("/") + 1; return [f.name.slice(0, n), f.name.slice(n)]; };
+    const fileRow = (f, n) => {
+      const [dir, base] = split2(f);
+      return h_flex().id(`file-${n}`).h(24).px(10).gap(6).items_center().whitespace_nowrap().cursor_pointer()
+        .when(n === at, (e) => e.bg(t.selection)).hover((e) => e.bg(t.hover))
+        .child(letter(f)).child(div().min_w(0).truncate().child(base))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(dir)).children(counts(f));
+    };
+    const fileList = (id) => div().flex_1().min_h(0).relative()
+      .child(div().absolute().inset_0().child(v_virtual_list(id, files.length, 24, (i) => String(i),
+        (range) => files.slice(range.start, range.end).map((f, k) => fileRow(f, range.start + k))).size_full()
+        .on_item_click((key, cx) => { this.toFile(Number(key)); this.drop = false; this.handle.focus(); cx.notify(); })))
+      .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0());
+    const cur = at === null ? null : files[at];
+    const pin = h_flex().id("pin").h(26).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).bg(t.surface).whitespace_nowrap()
+      .when(!panel, (e) => e.cursor_pointer().on_click((_e, cx) => { this.drop = !this.drop; cx.notify(); }))
+      .when(Boolean(cur), (e) => { const [dir, base] = split2(cur); return e.child(letter(cur))
+        .child(div().min_w(0).truncate().text_color(t.dim).child(dir)).child(div().flex_none().font_semibold().child(base)).children(counts(cur))
+        .child(div().flex_1()).child(div().flex_none().text_color(t.dim).child(`${at + 1}/${files.length}`)); })
+      .when(!cur && Boolean(stat), (e) => e.child(div().font_semibold().child(`${files.length} file${files.length > 1 ? "s" : ""} changed`)).children(counts(stat ?? {}))
+        .when(Boolean(stat?.partial), (e) => e.child(div().text_color(t.blocked).child("counted in the first 20000 lines"))).child(div().flex_1()))
+      .when(!panel, (e) => e.child(svg(`mods/workspace-chrome/chevron-${this.drop ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim)));
     return v_flex().id("smart-git-diff").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12)
       .track_focus(this.handle).on_key_down((e, cx) => { if (this.key(keyOf(e), cx)) cx.stop_propagation(); })
       // Sizes come back zoomed; lengths given to elements get zoomed again, so measure unzoomed.
       .on_mouse_move((e, cx) => { if (this.drag) { this.dx = this.drag.dx + (e.position.x - this.drag.x) / zoom * this.drag.k; cx.notify(); } })
       .on_mouse_up("left", (_e, cx) => { if (this.drag) { this.drag = null; cx.notify(); } })
-      .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
+      .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.paneW) > 1) { this.paneW = w; cx.notify(); } })
       .child(h_flex().h(32).flex_none().px(10).gap(2).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().font_semibold().child(this.title ?? "Select something in the git panel"))
         .when(this.ws, (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child("ignoring whitespace")))
@@ -689,26 +734,33 @@ export class Diff {
       .when(!this.pending && !this.error && !this.conflict && !this.rows.length && Boolean(this.shown), (e) => e.child(div().p(10).text_color(t.muted)
         .child(this.ws ? "Nothing to show: only whitespace changed (ctrl-w shows it)" : "Nothing to show here")))
       .when(Boolean(this.conflict) && !this.conflict.some((p) => !Array.isArray(p)), (e) => e.child(div().p(10).text_color(t.muted).child(this.shown?.note ?? "No conflict markers left. M in the files list keeps one side of the whole file.")))
+      .child(div().flex_1().min_h(0).relative().child(h_flex().absolute().inset_0().items_start()
+       .when(panel, (e) => e.child(v_flex().w(PANEL).flex_none().h_full().border_r(1).border_color(t.border)
+         .child(h_flex().h(26).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).whitespace_nowrap()
+           .child(div().font_semibold().child(`${files.length} file${files.length > 1 ? "s" : ""}`)).children(counts(stat))
+           .when(Boolean(stat?.partial), (e) => e.child(div().text_color(t.blocked).child("partial"))))
+         .child(fileList("smart-git-files"))))
+       // The diff's own width is what its rows are laid out to.
+       .child(v_flex().flex_1().min_w(0).h_full().relative()
+        .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.width) > 1) { this.width = w; cx.notify(); } })
+        .when(Boolean(stat), (e) => e.child(pin))
       .child(div().flex_1().min_h(0).relative().font_family(mono)
         .child(div().id("smart-git-x").size_full().when(this.wrapped() || split, (e) => e.overflow_hidden()).when(!this.wrapped() && !split, (e) => e.overflow_x_scrollbar())
           .when(sideways, (e) => e.on_scroll_wheel(wheel))
           // Where a press lands says which side of a row was clicked: the list only names the row.
           .child(div().w(wide).h_full().on_mouse_down("left", (e) => { this.downX = (e.local_position?.x ?? 0) / (Number(settings().zoom) || 1); this.clicks = e.click_count; })
             .child(v_virtual_list("smart-git-rows", rows.length, ROW, (i) => String(i),
-            (range) => rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k))).track_scroll(this.scroll).size_full()
+            (range) => {
+              // The measuring pass asks for one row; the placing pass says what's at the top.
+              if (range.end - range.start > 1) this.top = range.start;
+              return rows.slice(range.start, range.end).map((r, k) => split ? paired(r, range.start + k) : unified(r, range.start + k));
+            }).track_scroll(this.scroll).size_full()
             .on_item_click((key, cx) => {
               const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
               this.handle.focus();
               if (r?.kind === "g" && r.gap) { this.open.has(r.gap) ? this.open.delete(r.gap) : this.open.add(r.gap); this.loaded = null; }
               if (r?.kind === "@") { const n = this.rows.findIndex((x, j) => j > r.i && isChange(x)); if (n >= 0) { this.cur = n; this.hunk = true; this.anchor = null; } }
               if (r && (isChange(this.rows[r.i]) || r.kind === "L")) this.cur = r.i;
-              // A file in the --stat summary: its header at the top, the cursor on its first change.
-              if (r?.kind === "F" && r.file) {
-                const n = this.rows.findIndex((x, j) => j > r.file.i && (isChange(x) || x.kind === "f"));
-                if (isChange(this.rows[n])) { this.cur = n; this.hunk = false; this.anchor = null; }
-                const at = rows.findIndex((x) => (x.left ?? x).i === r.file.i);
-                if (at >= 0) this.scroll.scroll_to_item(at, "top");
-              }
               if (r?.side) { this.ci = r.c; this.side = r.side; }
               // A double-click on a branch or tag label checks it out, as Space does in its list.
               const hit = r?.kind === "L" && this.clicks >= 2 ? labelAt(r, this.downX, graphW) : null;
@@ -726,6 +778,9 @@ export class Diff {
             }))))
         .child(Scrollbar.vertical("smart-git-rows").viewport_from_layout().absolute().inset_0())
         .when(sideways && maxDx > 0, (e) => e.child(bar(0)).child(bar(half + 1))))
+        // Narrow: the pinned bar opens the file list over the diff.
+        .when(Boolean(stat) && !panel && this.drop, (e) => e.child(v_flex().absolute().top(26).left_0().right_0().h(Math.min(files.length, 12) * 24 + 2)
+          .bg(t.background).border_b(1).border_color(t.border).child(fileList("smart-git-drop")))))))
       .child(div().flex_none().px(12).py(5).border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim).truncate()
         .child(this.busy ? "Working…" : (this.anchor !== null ? "range · " : this.hunk ? "hunk · " : "") + (sideways ? "H/L scroll · " : "") + this.hints()));
   }
