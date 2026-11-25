@@ -2,13 +2,14 @@
 // (props.view "diff") and its own dialogs (props.view "ask").
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, openOverlay, closeOverlay, terminals, checking, agents, knownAgents, layout } from "herdr";
+import { props, panes, focused, theme, run, shared, setShared, watchFolder, nextCommand, exec, hc, closeOverlay, checking, layout } from "herdr";
 import {
   perf, location, git, findRoot, writeThere, rebaseWith, openEditor, parseStatus, parseLog, parseBranches, parseStash, parseSubmodules, parseWorktrees,
   parseRemotes, parseRefs, parseReflog, LOG_FORMAT, BRANCH_FORMAT, REF_FORMAT, REFLOG_FORMAT,
 } from "./git.js";
 import { Diff } from "./diff.js";
 import { ask, askFrom, confirm, keyOf, Ask, asking, cancelAsks } from "./ask.js";
+import { writeMessage, chosenAgent, savedAgent, pickAgent } from "./agent.js";
 
 const ROW = 26, HEAD = 30;
 const seen = new Map();
@@ -16,36 +17,6 @@ const seen = new Map();
 const entered = new Map();
 // The commit box's unsent subject and description, per repo.
 const drafts = new Map();
-// How each agent in Herdr's table (knownAgents keys) answers one prompt and exits: its arguments
-// ("{prompt}" where the prompt goes), the flag that picks a model, its models (a list, or the arguments
-// that print them), and the fast model Auto uses. The program is the agent's own `run`, so a
-// programs.json override is kept. Agents not here get "Set up…" (saved in smart-git:recipes).
-const RECIPES = {
-  claude: { args: ["-p", "{prompt}"], model: "--model", models: ["haiku", "sonnet", "opus", "fable"], fast: "haiku" },
-  codex: { args: ["exec", "--skip-git-repo-check", "{prompt}"], model: "-m" },
-  opencode: { args: ["run", "{prompt}"], model: "-m", list: ["models"] },
-  copilot: { args: ["-p", "{prompt}"], model: "--model" },
-  cursor: { args: ["-p", "{prompt}"], model: "--model", list: ["models"] },
-  grok: { args: ["-p", "{prompt}"], model: "-m", list: ["models"] },
-  pi: { args: ["-p", "{prompt}"], model: "--model" },
-  omp: { args: ["-p", "{prompt}"], model: "--model" },
-  antigravity: { args: ["-p", "{prompt}"], model: "--model", list: ["models"] },
-  amp: { args: ["-x", "{prompt}"] },
-  gemini: { args: ["-p", "{prompt}"], model: "-m" },
-  goose: { args: ["run", "-t", "{prompt}"] },
-  crush: { args: ["run", "{prompt}"] },
-  kiro: { args: ["chat", "--no-interactive", "{prompt}"] },
-};
-// Menu keys for long lists.
-const KEYS = "123456789abcdefghilmnopqrstuvwxyz"; // no j/k: they move in menus
-// A CLI's model list: the first word of each line that looks like a model id (has a digit, - or /).
-const modelIds = (text) => [...new Set(text.split("\n").map((l) => /^\s*[*•-]?\s*([\w.\/:@-]+)/.exec(l)?.[1]).filter((m) => m && /[\d\/-]/.test(m) && !m.endsWith(":")))];
-const PROMPT = `Write a git commit for the changes below.
-
-Reply with ONE JSON object and nothing else (no markdown, no code fences):
-{"subject": "one-line conventional-commit subject, imperative mood, max 72 chars, no trailing period", "body": "optional description: 1-3 sentences or bullet lines on what changed and why, \\n between lines; empty if the subject says it all"}
-
-`;
 const icon = (name) => svg(`mods/workspace-chrome/${name}.svg`);
 // Status is the title bar; the rest are the sidebar's sections, each with lazygit's tabs.
 const PANELS = [
@@ -534,120 +505,15 @@ class Sidebar {
     this.subject.set_value(""); this.body.set_value(""); this.handle.focus();
   }
 
-  // I: an agent CLI writes the commit box's subject and description from the staged changes
-  // (everything, when nothing is staged).
+  // I: an agent CLI writes the commit box's subject and description.
   async generate(cx) {
     if (!this.files.length) throw new Error("Nothing to commit");
-    const a = await this.chosenAgent();
-    if (!a) { throw new Error("No installed agent can write commit messages yet: ctrl-i sets one up"); }
+    const a = await chosenAgent(this.repo.on);
+    if (!a) throw new Error("No installed agent can write commit messages yet: ctrl-i sets one up");
     this.busy = `Writing message with ${a.name}…`; cx.notify();
-    const staged = this.files.some((f) => f.staged);
-    let [diff, log] = await Promise.all([
-      git(this.repo, ["diff", "--no-color", "--no-ext-diff", staged ? "--cached" : "HEAD"]).catch(() => ""),
-      git(this.repo, ["log", "-10", "--format=%s"]).catch(() => ""),
-    ]);
-    if (diff.length > 10000) diff = diff.slice(0, 10000) + "\n\n[... diff truncated ...]";
-    const files = this.files.filter((f) => !staged || f.staged).map((f) => `${f.x}${f.y} ${f.path}`).join("\n");
-    // The branch name and recent subjects let it follow the repo's own style (scopes, ticket ids).
-    const prompt = `${PROMPT}Branch: ${this.head.branch}\n\nRecent commit subjects (follow their style):\n${log}\nFiles:\n${files}\n\nDiff:\n${diff}`;
-    const opts = { cwd: this.repo.root, on: this.repo.on, timeout: 180000 };
-    const model = a.model ?? a.recipe?.fast;
-    // No stdin: some agents (codex) wait to read it when it isn't a terminal.
-    const r = a.custom ? await exec("sh", ["-c", `${a.custom} "$1" </dev/null`, "sh", prompt], opts)
-      : await exec("sh", ["-c", 'exec "$@" </dev/null', "sh", a.bin, ...a.recipe.args.map((x) => x === "{prompt}" ? prompt : x), ...(model && a.recipe.model ? [a.recipe.model, model] : [])], opts);
-    let m = null;
-    try { m = JSON.parse(/\{[\s\S]*\}/.exec(r.stdout)?.[0]); } catch {}
-    if (!m?.subject) throw new Error(`${a.name} wrote no commit message: ${(r.stderr.trim() || r.stdout.trim()).slice(-300)}`);
-    this.subject.set_value(m.subject.trim()); this.body.set_value(String(m.body ?? "").trim());
+    const m = await writeMessage(this.repo, this.files, this.head.branch, a);
+    this.subject.set_value(m.subject); this.body.set_value(m.body);
     this.subject.focus();
-  }
-
-  // The agents installed on the repo's machine, from Herdr's table (most picked first), each with
-  // how it answers one prompt (null: not set up).
-  async usableAgents() {
-    const setups = shared("smart-git:recipes") ?? {};
-    return (await knownAgents({ on: this.repo.on })).filter((a) => a.installed)
-      .map((a) => ({ key: a.key, name: a.name, bin: a.run[0], recipe: setups[a.key] ?? RECIPES[a.key] ?? null }));
-  }
-
-  // Auto: the agent most recently busy in this space (signed in, and likely the one that made the
-  // changes), else the most picked one; with its fast model.
-  autoAgent(list) {
-    const space = focused()?.space, ready = list.filter((a) => a.recipe);
-    const here = agents().filter((x) => x.space === space).sort((x, y) => y.seq - x.seq)
-      .map((x) => ready.find((a) => a.key === x.program.key)).find(Boolean);
-    const a = here ?? ready[0];
-    return a ? { ...a, model: null, why: here ? "running in this space" : "you use most" } : null;
-  }
-
-  // The saved choice (smart-git:agent): null for Auto, { key, model }, or { custom } (a plain string: custom).
-  savedAgent() { const s = shared("smart-git:agent"); return typeof s === "string" ? { custom: s } : s ?? null; }
-
-  // What writes the message: the saved choice, else Auto.
-  async chosenAgent() {
-    const pick = this.savedAgent();
-    if (pick?.custom) return { name: pick.custom, custom: pick.custom };
-    const list = await this.usableAgents(), a = pick && list.find((x) => x.key === pick.key && x.recipe);
-    return a ? { ...a, model: pick.model ?? null } : this.autoAgent(list);
-  }
-
-  // ctrl-i, or right-click ✨: the agent and model that write commit messages. Every installed agent
-  // is offered; one without a known recipe is set up once. `save` false: for one message only.
-  async pickAgent(save = true) {
-    const list = await this.usableAgents(), cur = save ? this.savedAgent() : undefined, auto = this.autoAgent(list);
-    const mark = (on) => on ? " ✓" : "";
-    const pick = await ask({ title: save ? "Agent for commit messages" : "Write this message with…", items: [
-      { key: "0", label: `Auto · ${auto ? auto.name + (auto.recipe.fast ? ` · ${auto.recipe.fast}` : "") : "none ready"}${mark(cur === null)}`, value: "auto",
-        hint: auto ? `The agent ${auto.why}, with its fast model.` : "Set up one of the agents below first." },
-      ...list.map((a, n) => ({ key: KEYS[n] ?? "", value: a.key,
-        label: `${a.name}${a.recipe ? "" : " · set up…"}${mark(cur?.key === a.key)}${cur?.key === a.key && cur.model ? ` (${cur.model})` : ""}`,
-        hint: a.recipe ? `${a.bin} ${a.recipe.args.join(" ")}` : `Tell Smart Git how ${a.bin} answers one prompt and exits.` })),
-      { key: "!", label: `Custom command…${mark(Boolean(cur?.custom))}`, value: "custom", hint: "Any CLI that prints its answer, the prompt as its last argument." },
-    ] });
-    if (!pick) return null;
-    if (pick === "auto") { if (save) setShared("smart-git:agent", null); return auto; }
-    if (pick === "custom") {
-      const c = (await ask({ title: "Agent command", detail: "The prompt is added as its last argument.", input: { value: cur?.custom ?? "", placeholder: "e.g. llm -m gpt-4o-mini" } }))?.text.trim();
-      if (!c) return null;
-      if (save) setShared("smart-git:agent", { custom: c });
-      return { name: c, custom: c };
-    }
-    let a = list.find((x) => x.key === pick);
-    if (!a.recipe) {
-      const r = await ask({ title: `Set up ${a.name}`, detail: `The arguments that make ${a.bin} answer one prompt and exit; {prompt} marks where the prompt goes.`, input: { placeholder: "e.g. -p {prompt}" } });
-      const args = r?.text.trim().split(/\s+/).filter(Boolean);
-      if (!args?.length) return null;
-      if (!args.includes("{prompt}")) args.push("{prompt}");
-      a = { ...a, recipe: { args } };
-      setShared("smart-git:recipes", { ...(shared("smart-git:recipes") ?? {}), [a.key]: a.recipe });
-    }
-    const model = await this.pickModel(a, cur?.key === a.key ? cur.model : undefined);
-    if (model === undefined) return null;
-    if (save) setShared("smart-git:agent", { key: a.key, model });
-    return { ...a, model };
-  }
-
-  // An agent's model: its list (asked of the CLI when it can print one; by provider first when long),
-  // its default, or one typed in. null: the default; undefined: cancelled.
-  async pickModel(a, current) {
-    const r = a.recipe;
-    if (!r.model) return null;
-    let models = r.models ?? [], prefix = "";
-    if (!models.length && r.list) models = modelIds((await exec(a.bin, r.list, { on: this.repo.on, timeout: 30000 }).catch(() => ({ stdout: "" }))).stdout);
-    const providers = [...new Set(models.filter((m) => m.includes("/")).map((m) => m.split("/")[0]))];
-    if (models.length > 20 && providers.length > 1) {
-      prefix = await ask({ title: `${a.name}: provider`, items: providers.map((p, n) => ({ key: KEYS[n] ?? "", label: p, value: p + "/" })) });
-      if (!prefix) return undefined;
-      models = models.filter((m) => m.startsWith(prefix));
-    }
-    const pick = await ask({ title: `${a.name}: model`, items: [
-      { key: "0", label: `Default${r.fast ? ` (${r.fast}, fast)` : " (the CLI's own)"}${current === null ? " ✓" : ""}`, value: "default" },
-      ...models.map((m, n) => ({ key: KEYS[n] ?? "", label: m.slice(prefix.length) + (m === current ? " ✓" : ""), value: m })),
-      { key: "!", label: "Other model…", value: "other" }] });
-    if (!pick) return undefined;
-    if (pick === "default") return null;
-    if (pick !== "other") return pick;
-    return (await ask({ title: `${a.name}: model`, input: { value: current ?? "", placeholder: "model id" } }))?.text.trim() || undefined;
   }
 
   async ignore(row) {
@@ -1272,7 +1138,7 @@ class Sidebar {
       R: ["Refresh", () => this.refresh(cx)],
       "|47": null,
       E: ["Choose editor…", () => act("…", () => this.pickEditor())],
-      "ctrl-i": ["Choose AI commit agent…", () => act("…", () => this.pickAgent())],
+      "ctrl-i": ["Choose AI commit agent…", () => act("…", () => pickAgent(this.repo.on))],
       // lazygit's "menu of what I can do here": the right-click menu, from the keyboard.
       x: () => this.menu(cx),
       "?": () => this.menu(cx, true),
@@ -1532,7 +1398,7 @@ class Sidebar {
     const tool = (id, tip, on, enabled = true) => div().id(id).size(24).flex_none().flex().items_center().justify_center().rounded(5)
       .text_color(enabled ? t.muted : t.dim).tooltip(tip)
       .when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((e, cx) => { on(cx, e); cx.notify(); }));
-    const agent = this.savedAgent();
+    const agent = savedAgent();
     const named = agent?.custom ?? (agent?.key ? agent.key + (agent.model ? ` · ${agent.model}` : "") : "Auto (the agent in this space)");
     const box = v_flex().id("commit-box").mx(10).mt(8).mb(6).flex_none().rounded(8).border_1().overflow_hidden().text_size(12.5)
       .border_color(this.typing ? t.accent : t.border).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -1540,7 +1406,7 @@ class Sidebar {
         .child(div().flex_1().min_w(0).h_full().child(Input.new(this.subject).h_full().text_size(12.5)))
         .child(tool("ai", writingAi ? "Writing the message…" : `Write the message with ${named} (I) · right-click: choose`,
           (cx) => this.act("Writing message…", (cx) => this.generate(cx), cx), !this.busy)
-          .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.act("…", () => this.pickAgent(), cx); })
+          .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.act("…", () => pickAgent(this.repo.on), cx); })
           .child(writingAi ? spin() : svg("mods/smart-git/sparkles.svg").size(13)))
         .child(tool("commit", "Commit (enter, ctrl-enter from the description)", (cx) => this.act("Committing…", () => this.commit(), cx), hasSubject && !this.busy)
           .child(this.busy === "Committing…" ? spin() : svg("mods/workspace-chrome/check.svg").size(14))))
