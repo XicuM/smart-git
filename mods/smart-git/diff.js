@@ -409,6 +409,7 @@ export class Diff {
       h: ["Previous conflict", () => toConflict(this.ci - 1)], left: () => toConflict(this.ci - 1), l: ["Next conflict", () => toConflict(this.ci + 1)], right: () => toConflict(this.ci + 1),
       k: ["Side above (ours, base)", () => sideBy(-1)], up: () => sideBy(-1), j: ["Side below (base, theirs)", () => sideBy(1)], down: () => sideBy(1),
       space: ["Resolve with the picked side", () => this.resolve(this.side, cx)], enter: () => this.resolve(this.side, cx), b: ["Keep both", () => this.resolve("both", cx)], z: ["Undo resolve", () => this.undoResolve(cx)],
+      e: ["Edit file at this conflict", () => this.editAt(cx)],
     } : {
       j: ["Next line", () => this.step(1)], down: () => this.step(1), k: ["Previous line", () => this.step(-1)], up: () => this.step(-1),
       g: ["First line", () => { this.cur = -1; this.step(1); }], G: ["Last line", () => { this.cur = this.rows.length; this.step(-1); }],
@@ -457,10 +458,12 @@ export class Diff {
   // e: the shown file in the editor, at the selected line (a removed line has no number in
   // the file: the next line that does). Opened from here: the sidebar may be hidden in its stack.
   editAt(cx) {
-    const s = this.shown, n = this.rows.slice(Math.max(0, this.cur)).find((r) => r.new != null)?.new;
+    // On a conflicted file: the selected conflict's first line.
+    const s = this.shown, n = this.conflict ? this.rows.find((r) => r.c === this.ci)?.new
+      : this.cur >= 0 ? this.rows.slice(this.cur).find((r) => r.new != null)?.new : null;
     if (s.title.endsWith("/")) { this.error = "A folder: pick one of its files to edit it"; return cx.notify(); }
     cx.spawn(async (cx) => {
-      try { await openEditor(s.repo, s.path, this.cur >= 0 && n ? n : null, cx); }
+      try { await openEditor(s.repo, s.path, n ?? null, cx); }
       catch (e) { this.error = String(e.message ?? e); cx.notify(); }
     });
   }
@@ -537,7 +540,7 @@ export class Diff {
 
   hints() {
     const s = this.shown;
-    if (this.conflict) return "h/l conflict · j/k side (ours, base, theirs) · space pick · b both · z undo the last pick · esc back";
+    if (this.conflict) return "h/l conflict · j/k side · space keep it · b both · click a side's name above a conflict · e edit · z undo the last pick · esc back";
     const pick = "j/k line · ←/→ hunk · J/K file · v range · a hunk";
     if (s?.kind === "file") return `${pick} · space stage · d discard · e edit · f full file · z zoom · {/} context · esc back`;
     if (s?.kind === "commit") return `${pick} · space move out of commit · f full file · z zoom · esc back`;
@@ -550,6 +553,7 @@ export class Diff {
   render2(cx) { // PERF
     this.sync(cx);
     const t = theme(), mono = settings().font_family ?? "JetBrains Mono", focused = this.handle.is_focused();
+    const cs = this.conflict?.filter((p) => !Array.isArray(p)) ?? [];
     const split = this.sideBySide();
     // Wide enough for the longest line, so the pane scrolls sideways instead of cutting it.
     const text = this.wrapped() ? 0 : Math.ceil((this.longest ?? 0) * CHAR);
@@ -657,7 +661,20 @@ export class Diff {
       if (r.kind === "g") return div().px(10).h(ROW).flex_none().bg(t.surface).text_color(t.accent).cursor_pointer().whitespace_nowrap().child(r.text);
       if (r.kind === "h") return header(r);
       if (r.kind === "L") return logLine(r, v);
-      if (["<", "|", "=", ">"].includes(r.kind)) return h_flex().h(ROW).flex_none().text_color(r.c === this.ci ? t.blocked : t.dim).child(num(r.new)).child(div().w(14).flex_none()).child(div().whitespace_nowrap().child(r.text));
+      if (["<", "|", "=", ">"].includes(r.kind)) {
+        const line = h_flex().h(ROW).flex_none().text_color(r.c === this.ci ? t.blocked : t.dim).child(num(r.new)).child(div().w(14).flex_none()).child(div().whitespace_nowrap().child(r.text));
+        if (r.kind !== "<" || !cs[r.c]) return line;
+        // As VS Code's links over a conflict: each keeps a side, named as its marker line names it
+        // (HEAD, a branch, a commit), since "ours" and "theirs" swap meaning in a rebase.
+        const p = cs[r.c], named = (l, or) => { const n = (l ?? "").replace(/^[<>|]+ ?/, "").trim() || or; return n.length > 32 ? n.slice(0, 31) + "…" : n; };
+        const link = (how, label, color) => div().id(`take-${r.c}-${how}`).flex_none().px(6).rounded(4).text_color(color).cursor_pointer().hover((e) => e.bg(t.hover))
+          .on_click((_e, cx) => { cx.stop_propagation(); this.handle.focus(); this.ci = r.c; this.resolve(how, cx); }).child(label);
+        return line.gap(2).child(div().w(10).flex_none())
+          .child(link("ours", `Keep ${named(p.head, "ours")}`, t.ansi2))
+          .child(link("theirs", `Keep ${named(p.tail, "theirs")}`, t.ansi4))
+          .child(link("both", "Keep both", t.muted))
+          .when(Boolean(p.base), (e) => e.child(link("base", `Keep ${named(p.mid, "base")}`, t.muted)));
+      }
       return null;
     };
     // A line's text, with the part that changed from its paired line (`hl`) in a stronger color.
@@ -739,6 +756,7 @@ export class Diff {
       .on_size_change((size, cx) => { const w = size.width / (Number(settings().zoom) || 1); if (Math.abs(w - this.paneW) > 1) { this.paneW = w; cx.notify(); } })
       .child(h_flex().h(32).flex_none().px(10).gap(2).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).truncate().font_semibold().child(this.title ?? "Select something in the git panel"))
+        .when(cs.length > 0, (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child(`conflict ${this.ci + 1} of ${cs.length}`)))
         .when(this.ws, (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child("ignoring whitespace")))
         .when(this.context !== 3 && !this.full, (e) => e.child(div().px(6).text_size(11).text_color(t.dim).child(`${this.context} lines of context`)))
         .when(Boolean(this.truncated), (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child(`only the first 20000 of ${this.truncated} lines`)))
@@ -788,6 +806,7 @@ export class Diff {
               if (r?.kind === "g" && r.gap) { this.open.has(r.gap) ? this.open.delete(r.gap) : this.open.add(r.gap); this.loaded = null; }
               if (r?.kind === "@") { const n = this.rows.findIndex((x, j) => j > r.i && isChange(x)); if (n >= 0) { this.cur = n; this.hunk = true; this.anchor = null; } }
               if (r && (isChange(this.rows[r.i]) || r.kind === "L")) this.cur = r.i;
+              if (r?.side) { this.ci = r.c; this.side = r.side; }
               if (r?.side) { this.ci = r.c; this.side = r.side; }
               // A double-click on a branch or tag label checks it out, as Space does in its list.
               const hit = r?.kind === "L" && this.clicks >= 2 ? labelAt(r, this.downX, graphW) : null;

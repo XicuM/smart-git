@@ -476,6 +476,14 @@ class Sidebar {
   // --- Files ---
   async toggleStage(row) {
     const files = row.file ? [row.file] : row.files, paths = files.map((f) => f.path);
+    // A conflicted file still holding markers: staging marks it resolved, so ask first, as VS Code does.
+    const conflicted = files.filter((f) => f.conflict && !f.whole).map((f) => f.path);
+    if (conflicted.length) {
+      const out = await git(this.repo, ["diff", "--check", "--", ...conflicted]).then(() => "", (e) => e.message);
+      const left = [...new Set(out.split("\n").filter((l) => l.endsWith("leftover conflict marker")).map((l) => l.replace(/:\d+:.*$/, "")))];
+      if (left.length && !await confirm(left.length > 1 ? `${left.length} files still have conflict markers` : `${left[0]} still has conflict markers`,
+        "Staging marks them resolved with the markers in the file.", "Stage anyway", false)) return;
+    }
     if (files.some((f) => f.unstaged)) return this.w(["add", "--", ...paths]);
     if (this.commits.length) return this.w(["restore", "--staged", "--", ...paths]);
     return this.w(["rm", "--cached", "-r", "-q", "--", ...paths]);
