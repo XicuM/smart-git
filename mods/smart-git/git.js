@@ -266,13 +266,16 @@ export const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).p
 // Unified diff text (possibly several files, possibly after a commit header) into rows:
 // kind "h" (header text), "f" (file: `path` its new side, null when deleted; `notes`, like
 // "renamed from x"), "@" (hunk: `text` its function, `line` where it starts), "g" (the unchanged
-// lines before a hunk: `from`..`to` on the new side, `old` the first one's number on the old),
+// lines before a hunk: `from`..`to` on the new side, `old` the first one's number on the old;
+// after a file's last hunk `to` is null, the rest of the file),
 // "+", "-", " ". A +/- row keeps `raw`, its line in `text`, for building patches, and when it
 // pairs with a line of the other kind `hl`, the [start, end) of what changed in it.
 // `rows.truncated` is set when the diff was too long to show whole.
-export function diffRows(text) {
+// `context` is the -U it was made with: a last hunk ending on fewer unchanged lines hit the file's end.
+export function diffRows(text, context) {
   const all = text.replace(/\n$/, "").split("\n"), lines = all.slice(0, 20000), rows = [];
-  let old = 0, next = 0, inHunk = false, file = null, mode = null;
+  let old = 0, next = 0, inHunk = false, file = null, mode = null, tail = 0, eof = false;
+  const end = () => { if (file?.path && inHunk && tail >= context && !eof) rows.push({ kind: "g", from: next, to: null, old, path: file.path, text: "⋯ rest of the file" }); };
   for (let raw = 0; raw < lines.length; raw++) {
     const line = lines[raw];
     const cut = line.length > 4000 ? line.slice(0, 4000) + "…" : line;
@@ -281,15 +284,15 @@ export function diffRows(text) {
       // A side with no lines in the hunk names the line before it.
       const at = +m[3] + (m[4] === "0" ? 1 : 0), n = at - next;
       if (file?.path && n > 0) rows.push({ kind: "g", from: next, to: at - 1, old, path: file.path, text: `⋯ ${n} unchanged line${n > 1 ? "s" : ""}` });
-      old = +m[1] + (m[2] === "0" ? 1 : 0); next = at; inHunk = true; rows.push({ kind: "@", text: untab(m[5]), line: at }); continue;
+      old = +m[1] + (m[2] === "0" ? 1 : 0); next = at; inHunk = true; tail = 0; eof = false; rows.push({ kind: "@", text: untab(m[5]), line: at }); continue;
     }
     if (cut.startsWith("diff --git ")) {
-      inHunk = false; old = next = 1; mode = null;
+      end(); inHunk = false; old = next = 1; mode = null;
       const path = cut.replace(/^diff --git a\/(.*) b\/.*$/, "$1");
       rows.push(file = { kind: "f", text: path, path, notes: [] }); continue;
     }
     // `--submodule=log`: "Submodule <path> <a>..<b>:" then "  > added" / "  < removed" commits.
-    if (cut.startsWith("Submodule ")) { inHunk = false; file = null; rows.push({ kind: "f", text: cut }); continue; }
+    if (cut.startsWith("Submodule ")) { end(); inHunk = false; file = null; rows.push({ kind: "f", text: cut }); continue; }
     if (!inHunk && /^\s+[<>] /.test(cut)) { rows.push({ kind: "h", text: cut, tone: cut.trim()[0] === ">" ? "+" : "-" }); continue; }
     if (!inHunk) {
       let n;
@@ -305,11 +308,13 @@ export function diffRows(text) {
       continue;
     }
     const k = cut[0], body = untab(cut.slice(1)) || " ";
-    if (k === "-") rows.push({ kind: "-", old: old++, text: body, raw });
-    else if (k === "+") rows.push({ kind: "+", new: next++, text: body, raw });
-    else if (k === " ") rows.push({ kind: " ", old: old++, new: next++, text: body });
-    else rows.push({ kind: "h", text: cut });
+    if (k === "-") { rows.push({ kind: "-", old: old++, text: body, raw }); tail = 0; }
+    else if (k === "+") { rows.push({ kind: "+", new: next++, text: body, raw }); tail = 0; }
+    else if (k === " ") { rows.push({ kind: " ", old: old++, new: next++, text: body }); tail++; }
+    // "\ No newline at end of file" after a new-side line: the file ends here.
+    else { eof ||= k === "\\" && rows.at(-1)?.kind !== "-"; rows.push({ kind: "h", text: cut }); }
   }
+  if (lines.length === all.length) end();
   // A run of removals and the additions after it pair up, line by line, like side by side.
   for (let i = 0; i < rows.length;) {
     if (rows[i].kind !== "-") { i++; continue; }

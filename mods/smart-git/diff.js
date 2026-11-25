@@ -8,7 +8,7 @@ import { ask, askFrom, keyOf } from "./ask.js";
 import { perf, git, writeThere, rebaseWith, openEditor, diffRows, splitRows, partialPatch, parseConflicts, logRows, LOG_GRAPH, untab } from "./git.js";
 
 const ROW = 20, CHAR = 7.3;
-const BANDS = ["s", "f", "@", "g", "h", "<", "|", "=", ">"];
+const BANDS = ["s", "F", "f", "@", "g", "h", "<", "|", "=", ">"];
 const isChange = (r) => r?.kind === "+" || r?.kind === "-";
 // Selections shown as a commit graph rather than a diff.
 const LOGS = ["branch", "remote", "status"];
@@ -44,7 +44,7 @@ function labelAt(r, x, graphW) {
 // The git commands that show each kind of selection, as labelled sections.
 function sources(s, o) {
   // a/ and b/ whatever the user's config (diff.mnemonicPrefix, diff.noprefix): rows parse paths.
-  const flags = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", `--submodule=${o.sub}`, `-U${o.full ? 1000000 : o.context}`, ...(o.ws ? ["-w"] : [])];
+  const flags = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", `--submodule=${o.sub}`, `-U${o.context}`, ...(o.ws ? ["-w"] : [])];
   if (s.kind === "file") {
     const out = [], path = ["--", s.path];
     if (s.unstaged) out.push(["Unstaged changes", s.untracked ? ["diff", "--no-index", ...flags, "--", "/dev/null", s.path] : ["diff", ...flags, ...path]]);
@@ -128,15 +128,23 @@ export class Diff {
           if (label && label !== texts[texts.length - 1]?.label) rows.push({ kind: "s", text: label });
           const src = texts.push({ label, text }) - 1;
           if (LOGS.includes(s.kind)) { rows.push(...logRows(text)); continue; }
-          const d = diffRows(text);
+          const d = diffRows(text, this.context);
           truncated = Math.max(truncated, d.truncated ?? 0);
           for (const r of d) {
             const gap = r.kind === "g" ? `${label}|${r.path}|${r.from}` : null;
-            if (gap && this.open.has(gap)) {
+            // Whole file (f) opens every gap; a click flips one from how f has it.
+            if (gap && this.full !== this.open.has(gap)) {
               const k = `${label}|${r.path}`;
               if (!files.has(k)) files.set(k, await newSide(label, r.path).catch(() => null));
               const lines = files.get(k);
-              if (lines) { for (let n = r.from; n <= r.to; n++) rows.push({ kind: " ", old: r.old + n - r.from, new: n, text: untab(lines[n - 1] ?? "") || " ", src }); continue; }
+              if (lines) {
+                const to = r.to ?? lines.length - (lines.at(-1) === "" ? 1 : 0), n = to - r.from + 1;
+                if (n <= 0) continue;
+                // The bar stays where it was clicked, now to fold them away again.
+                rows.push({ ...r, src, gap, text: `⌃ hide ${n} unchanged line${n > 1 ? "s" : ""}` });
+                for (let i = r.from; i <= to; i++) rows.push({ kind: " ", old: r.old + i - r.from, new: i, text: untab(lines[i - 1] ?? "") || " ", src });
+                continue;
+              }
             }
             rows.push({ ...r, src, gap });
           }
@@ -150,6 +158,26 @@ export class Diff {
         const n = rows.findIndex((r) => r.src === at.src && r.raw === at.raw);
         const a = this.anchor !== null ? rows.findIndex((r) => r.src === at.src && r.raw === this.rows[this.anchor]?.raw) : -1;
         if (n >= 0) { this.cur = n; this.anchor = a >= 0 ? a : null; }
+      }
+      // Lazygit's --stat: what a commit, stash or range changes, file by file, above the first file.
+      if (["commit", "stash", "range"].includes(s.kind)) {
+        let head = null;
+        for (const r of rows) {
+          if (r.kind === "f") { head = r; r.add = r.del = 0; } else if (head && r.kind === "+") head.add++; else if (head && r.kind === "-") head.del++;
+        }
+        const heads = rows.filter((r) => r.kind === "f");
+        if (heads.length) {
+          const most = Math.max(1, ...heads.map((f) => f.add + f.del)), name = (f) => f.path ?? f.text.replace(/^Submodule (\S+).*/, "$1");
+          const widest = (k) => Math.max(...heads.map((f) => f[k] ? String(f[k]).length + 1 : 0));
+          const cols = { w: Math.min(60, Math.max(...heads.map((f) => name(f).length))), aw: widest("add"), dw: widest("del"), most };
+          // One blank line above it (the message ends with two) and one below.
+          let at = rows.indexOf(heads[0]);
+          while (at > 1 && rows[at - 1].kind === "h" && !rows[at - 1].text.trim() && rows[at - 2].kind === "h" && !rows[at - 2].text.trim()) rows.splice(--at, 1);
+          rows.splice(at, 0,
+            { kind: "F", text: "", count: heads.length, add: heads.reduce((n, f) => n + f.add, 0), del: heads.reduce((n, f) => n + f.del, 0), partial: truncated > 0 },
+            ...heads.map((f) => ({ kind: "F", text: "", file: f, name: name(f), ...cols })),
+            { kind: "h", text: "" });
+        }
       }
       rows.forEach((r, i) => { r.i = i; });
       // A commit's subject: the first message line under its header.
@@ -363,7 +391,7 @@ export class Diff {
     };
     const common = {
       s: ["Change layout", () => this.setLayout({ auto: "split", split: "unified", unified: "auto" }[this.layout])], w: ["Wrap lines", () => this.toggle("wrap")],
-      "ctrl-w": ["Ignore whitespace", () => this.toggle("ws")], f: ["Whole file", () => this.toggle("full")],
+      "ctrl-w": ["Ignore whitespace", () => this.toggle("ws")], f: ["Whole file", () => { this.toggle("full"); this.open = new Set(); }],
       S: ["Toggle submodule diff", () => { this.sub = this.sub === "log" ? "diff" : "log"; setShared("smart-git:sub", this.sub); }],
       "{": ["Less context", () => { this.context = Math.max(0, this.context - 1); setShared("smart-git:context", this.context); }],
       "}": ["More context", () => { this.context++; setShared("smart-git:context", this.context); }],
@@ -579,8 +607,31 @@ export class Diff {
     };
     const band = (r, v) => {
       if (r.kind === "s") return div().px(10).h(ROW).flex_none().bg(t.raised).text_color(t.accent).font_semibold().child(r.text);
+      // The --stat summary, one block: its total, then a row per file (click goes to it).
+      if (r.kind === "F" && !r.file) return h_flex().px(10).gap(8).h(ROW).flex_none().bg(t.surface).whitespace_nowrap()
+        .child(div().font_semibold().child(`${r.count} file${r.count > 1 ? "s" : ""} changed`))
+        .child(div().text_color(t.ansi2).child(`+${r.add}`)).child(div().text_color(t.ansi1).child(`−${r.del}`))
+        .when(r.partial, (e) => e.child(div().text_color(t.blocked).child("counted in the first 20000 lines")));
+      if (r.kind === "F") {
+        const f = r.file, n = f.notes ?? [], has = (w) => n.some((x) => x.startsWith(w));
+        const l = has("new file") ? "A" : has("deleted") ? "D" : has("renamed") ? "R" : has("copied") ? "C" : "M";
+        const cut = r.name.lastIndexOf("/") + 1;
+        return h_flex().id(`stat-${r.i}`).px(10).gap(8).h(ROW).flex_none().bg(t.surface).whitespace_nowrap().cursor_pointer().hover((e) => e.bg(t.hover))
+          .child(div().w(CHAR).flex_none().font_semibold().text_color(l === "A" ? t.ansi2 : l === "D" ? t.ansi1 : t.blocked).child(l))
+          // The folder dim, the file's own name in full ink.
+          .child(h_flex().w(r.w * CHAR).flex_none().overflow_hidden()
+            .child(div().flex_shrink_1().min_w(0).truncate().text_color(t.dim).child(r.name.slice(0, cut)))
+            .child(div().flex_none().child(r.name.slice(cut))))
+          .child(div().w(r.aw * CHAR).flex_none().text_right().text_color(t.ansi2).child(f.add ? `+${f.add}` : ""))
+          .child(div().w(r.dw * CHAR).flex_none().text_right().text_color(t.ansi1).child(f.del ? `−${f.del}` : ""))
+          .child(h_flex().w(80).h(6).flex_none().rounded(3).overflow_hidden()
+            .child(div().h_full().w(80 * f.add / r.most).bg(t.ansi2))
+            .child(div().h_full().w(80 * f.del / r.most).bg(t.ansi1)))
+          .children(n.includes("binary") ? [div().text_color(t.dim).child("binary")] : []);
+      }
       if (r.kind === "f") return h_flex().px(10).gap(10).h(ROW).flex_none().bg(t.raised).whitespace_nowrap()
         .child(div().flex_none().text_color(t.foreground).font_semibold().child(r.text))
+        .when(Boolean(r.add || r.del), (e) => e.child(div().flex_none().text_color(t.ansi2).child(r.add ? `+${r.add}` : "")).child(div().flex_none().text_color(t.ansi1).child(r.del ? `−${r.del}` : "")))
         .children((r.notes ?? []).map((n) => div().flex_none().text_color(t.blocked).child(n)));
       // A hunk: the line it starts at and the function it's in (click selects it).
       if (r.kind === "@") return h_flex().px(10).gap(10).h(ROW).flex_none().whitespace_nowrap().cursor_pointer()
@@ -628,7 +679,7 @@ export class Diff {
         .when(this.context !== 3 && !this.full, (e) => e.child(div().px(6).text_size(11).text_color(t.dim).child(`${this.context} lines of context`)))
         .when(Boolean(this.truncated), (e) => e.child(div().px(6).text_size(11).text_color(t.blocked).child(`only the first 20000 of ${this.truncated} lines`)))
         // The whole file (git with unlimited context), or only the changes and a few lines round them.
-        .when(!this.conflict && !this.isLog(), (e) => e.child(button("full", "unfold-vertical", this.full, "Show the whole file (f)", () => this.toggle("full"))))
+        .when(!this.conflict && !this.isLog(), (e) => e.child(button("full", "unfold-vertical", this.full, "Show the whole file (f)", () => { this.toggle("full"); this.open = new Set(); })))
         .child(button("wrap", "wrap-text", this.wrap, "Wrap long lines (w)", () => this.toggle("wrap")))
         .when(!this.conflict && !this.isLog(), (e) => e.child(div().w(1).h(16).mx(4).bg(t.border))
           .child(button("unified", "rows-2", this.layout === "unified", "Unified: old and new lines in one column (s)", () => this.setLayout("unified")))
@@ -648,9 +699,16 @@ export class Diff {
             .on_item_click((key, cx) => {
               const v = rows[Number(key)], r = !split ? v : this.downX > half ? (v?.right ?? v?.left) : (v?.left ?? v?.right);
               this.handle.focus();
-              if (r?.kind === "g" && r.gap) { this.open.add(r.gap); this.loaded = null; }
+              if (r?.kind === "g" && r.gap) { this.open.has(r.gap) ? this.open.delete(r.gap) : this.open.add(r.gap); this.loaded = null; }
               if (r?.kind === "@") { const n = this.rows.findIndex((x, j) => j > r.i && isChange(x)); if (n >= 0) { this.cur = n; this.hunk = true; this.anchor = null; } }
               if (r && (isChange(this.rows[r.i]) || r.kind === "L")) this.cur = r.i;
+              // A file in the --stat summary: its header at the top, the cursor on its first change.
+              if (r?.kind === "F" && r.file) {
+                const n = this.rows.findIndex((x, j) => j > r.file.i && (isChange(x) || x.kind === "f"));
+                if (isChange(this.rows[n])) { this.cur = n; this.hunk = false; this.anchor = null; }
+                const at = rows.findIndex((x) => (x.left ?? x).i === r.file.i);
+                if (at >= 0) this.scroll.scroll_to_item(at, "top");
+              }
               if (r?.side) { this.ci = r.c; this.side = r.side; }
               // A double-click on a branch or tag label checks it out, as Space does in its list.
               const hit = r?.kind === "L" && this.clicks >= 2 ? labelAt(r, this.downX, graphW) : null;

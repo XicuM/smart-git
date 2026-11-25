@@ -21,7 +21,7 @@ The sidebar is one card: a title bar (repo and branch), a VS Code-style commit b
    - Reflog, Stash (`{n}` then subject), Tags (name, subject, age), Remotes (name, url; enter opens its branches), Worktrees (`*` on the one you are in, branch, `~` path), Submodules (state mark, nested ones indented, `not checked out` in `dim`).
 6. A red note line (click to dismiss) when an action fails; a 10.5px `dim` hint line at the bottom with the first six keys of the current list and `? all keys`.
 
-**Diff pane**, a normal Herdr pane titled `smart-git`: a header with the selection's title and two icon buttons (wrap, split/unified), a virtualized, scrollable list of 20px rows, and a hint line. Unified by default, side by side with `s`. Green/red added/removed lines, `@@` hunk headers, file headers, and for a branch a `git log --graph`. Shows "Select something in the git panel" until something is selected.
+**Diff pane**, a normal Herdr pane titled `smart-git`: a header with the selection's title and two icon buttons (wrap, split/unified), a virtualized, scrollable list of 20px rows, and a hint line. Unified by default, side by side with `s`. Green/red added/removed lines, `@@` hunk headers, file headers with their `+n −m`, and for a branch a `git log --graph`. A commit, stash or range starts with lazygit's `--stat`, counted from the diff's own rows (no extra git call): "n files changed +a −d", then a row per file (status letter A/M/D/R/C, path, counts, a green/red bar scaled to the biggest file); clicking one scrolls to that file. Diffs cut at 20000 lines say their counts are partial. Shows "Select something in the git panel" until something is selected.
 
 ## How it behaves
 
@@ -38,9 +38,9 @@ The sidebar is one card: a title bar (repo and branch), a VS Code-style commit b
   - Submodules: `enter` goes into it (breadcrumb), `u` update, `i` init, `n` add, `e` edit URL, `d` remove, `b` bulk menu, `y` copy path, `o` terminal there.
   - Worktrees: `enter`/`space` switch, `n` new, `d` remove, `o` terminal. Stash: `space` apply, `g` pop, `d` drop, `n` branch, `r` rename.
   - Everywhere: `p` pull, `P` push, `f` fetch all, `z` undo from reflog, `R` refresh, `m` continue/abort an operation in progress. Destructive actions ask first.
-- **Diff pane keys** (focused): `j/k` line, `g/G` ends, `v` range, `a` hunk, `s` split/unified, `w` wrap, `ctrl-w` ignore whitespace, `{`/`}` context lines (default 3), `S` submodule log/diff, `z` zoom, `esc`/`q`/`h` back to the sidebar. On a file: `space` stages/unstages the selected lines or hunk, `d` discards them. On a commit: `space` moves the selected lines out of it. On a conflicted file: `j/k` next conflict, `h/l` ours/theirs, `space`/`enter` take it, `b` both, `z` undo.
+- **Diff pane keys** (focused): `j/k` line, `g/G` ends, `v` range, `a` hunk, `s` split/unified, `w` wrap, `ctrl-w` ignore whitespace, `{`/`}` context lines (default 3), `f` whole file (opens every gap: a `⋯ n unchanged lines` bar before each hunk and one for the rest of the file; clicking one opens or folds just it, `⌃ hide` once open), `S` submodule log/diff, `z` zoom, `esc`/`q`/`h` back to the sidebar. On a file: `space` stages/unstages the selected lines or hunk, `d` discards them. On a commit: `space` moves the selected lines out of it. On a conflicted file: `j/k` next conflict, `h/l` ours/theirs, `space`/`enter` take it, `b` both, `z` undo.
 - Agent statuses are not used by this mod; it only reacts to git state.
-- State shared across copies: folded sections, active tabs, tree/flat, split/wrap/whitespace/context (`smart-git:*` shared keys), so the sidebar and diff pane agree and survive restarts.
+- State shared across copies: folded sections, active tabs, tree/flat, split/wrap/whitespace/context/whole file (`smart-git:*` shared keys), so the sidebar and diff pane agree and survive restarts.
 
 ## Built from
 
