@@ -1,6 +1,6 @@
 # Smart Git
 
-A [lazygit](https://github.com/jesseduffield/lazygit)-style git panel for Herdr. It lives in the sidebar, works with the keyboard or the mouse, and opens diffs in a pane beside your terminals.
+An upgrade for Herdr's default **Changes** sidebar. It replaces the Changes panel with a [lazygit](https://github.com/jesseduffield/lazygit)-style git panel: files, branches, commits and stash in one card, usable with the keyboard or the mouse, with diffs that open in a pane beside your terminals.
 
 ![Smart Git](preview.png)
 
@@ -14,6 +14,12 @@ A [lazygit](https://github.com/jesseduffield/lazygit)-style git panel for Herdr.
 - **Agent-written commit messages**: press ✨ (or `I`) and an agent CLI you already have installed (Claude, Codex, Copilot, Amp, ...) writes the message in your repo's style. Right-click ✨ to pick the agent and model.
 - **Submodules**: step into one, commit, and step back out, with a breadcrumb to show where you are.
 - **Follows your terminal**: switches to the repo of the focused terminal's folder, including remote spaces.
+
+## In your window
+
+Select a file, commit or branch and its diff opens beside your terminal.
+
+![Smart Git in Herdr: the diff opens beside your terminal](screenshot.png)
 
 ## Keys
 
