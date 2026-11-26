@@ -289,7 +289,7 @@ class Sidebar {
     const keep = (r) => !q || r.text.toLowerCase().includes(q);
     if (view === "status") return this.repo ? [{ id: "status", text: "" }] : [];
     if (view === "worktrees") return this.worktrees.map((w) => ({ id: w.path, worktree: w, text: `${w.branch} ${w.path}` })).filter(keep);
-    if (view === "submodules") return this.submodules.map((s) => ({ id: s.path, sub: s, text: s.path })).filter(keep);
+    if (view === "submodules") return this.submodules.map((s) => ({ id: s.path, sub: s, name: s.name, text: `${s.name} ${s.path}` })).filter(keep);
     if (view === "branches") return this.branches.map((b) => ({ id: b.name, branch: b, text: b.name })).filter(keep);
     if (view === "remotes") return this.remotes.map((r) => ({ id: r.name, remote: r, text: `${r.name} ${r.url}` })).filter(keep);
     if (view === "remote-branches") return this.remoteBranches.filter((b) => b.name.startsWith(this.inRemote + "/")).map((b) => ({ id: b.name, rbranch: b, text: b.name })).filter(keep);
@@ -1287,7 +1287,7 @@ class Sidebar {
     if (row.sub) {
       const s = row.sub;
       return base.pl(8 + s.depth * 12).child(div().flex_none().w(10).text_color(s.state === "+" ? t.blocked : s.state === "U" ? t.ansi1 : t.dim).child(s.state.trim()))
-        .child(name(s.depth ? s.rel : s.path, s.state === "-" ? t.dim : t.foreground)).when(s.state === "-", (e) => e.child(dim("not checked out")));
+        .child(name(s.name, s.state === "-" ? t.dim : t.foreground)).when(s.state === "-", (e) => e.child(dim("not checked out")));
     }
     if (row.worktree) {
       const w = row.worktree, here = w.path === this.repo?.root;
