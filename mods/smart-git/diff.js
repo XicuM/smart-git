@@ -28,7 +28,7 @@ function wrapText(text, n) {
 }
 
 // A graph label's parts (the name, then the remotes level with it) and their widths at 11px mono.
-const labelParts = (ref) => [(ref.tone === "head" && ref.view ? "✓ " : "") + ref.name, ...(ref.remotes ?? [])]
+const labelParts = (ref) => [(ref.tone === "head" && ref.view ? "✓ " : "") + (ref.shown ?? ref.name), ...(ref.remotes ?? [])]
   .map((text) => ({ text, w: Math.ceil(8 + text.length * 6.6) }));
 // The label at x in a graph row: after the hash (10 + 8 chars), the graph, and a gap of 8 each.
 function labelAt(r, x, graphW) {
@@ -508,22 +508,21 @@ export class Diff {
   // The author column: as wide as the longest author shown, at most 14 characters.
   authorW() { return CHAR * Math.min(14, this.rows.reduce((n, r) => Math.max(n, r.author?.length ?? 0), 1)); }
   graphW() { return Math.min(12 + (this.rows[0]?.lanes ?? 1) * 12, Math.max(60, this.width * 0.4)); }
-  // A graph row's labels, wrapped: the first row keeps room for the subject, author and date
-  // columns; the labels that don't fit go on rows below it, the lanes running straight through.
+  // A graph row's labels, cut to half the room between the graph and the author column: a label
+  // that doesn't fit gets an ellipsis, and those after the room runs out are left out.
   logPieces(r) {
-    const left = 10 + CHAR * 8 + 8 + this.graphW() + 8, wide = (ref) => labelParts(ref).reduce((n, p) => n + p.w, 2) + 8;
-    const out = [];
-    let refs = [], room = this.width - left - (CHAR * 16 + 8) - (this.authorW() + 8) - CHAR * 4 - 10;
+    const left = 10 + CHAR * 8 + 8 + this.graphW() + 8;
+    let room = Math.max(60, (this.width - left - (this.authorW() + 8) - CHAR * 4 - 10) / 2);
+    const refs = [];
     for (const ref of r.refs) {
-      // Even the first label moves down when it doesn't fit, leaving the subject its row.
-      if ((refs.length || !out.length) && wide(ref) > room) {
-        out.push(out.length ? { ...r, refs, cont: true } : { ...r, refs });
-        refs = []; room = this.width - left - 10;
-      }
-      refs.push(ref); room -= wide(ref);
+      const full = labelParts(ref).reduce((n, p) => n + p.w, 2) + 8;
+      if (full <= room) { refs.push(ref); room -= full; continue; }
+      const rest = (ref.remotes ?? []).reduce((n, p) => n + Math.ceil(8 + p.length * 6.6), 2) + 8;
+      const chars = Math.floor((room - rest - 8) / 6.6) - (ref.tone === "head" && ref.view ? 2 : 0);
+      if (chars >= 4) refs.push({ ...ref, shown: ref.name.slice(0, chars - 1) + "…" });
+      break;
     }
-    out.push(out.length ? { ...r, refs, cont: true } : { ...r, refs });
-    return out;
+    return [{ ...r, refs }];
   }
 
   visual() {
